@@ -1,0 +1,11 @@
+rasterio
+numpy
+pandas
+matplotlib
+shapely
+pyproj
+requests
+geopandas
+openpyxl
+fiona
+rtree
