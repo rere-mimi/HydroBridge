@@ -240,11 +240,12 @@ out geom;
 
 # Transect generation
 
-def generate_transects(centerline: LineString, distances_m=[0], interval=50, n_each_side=3, length_m=200):
+def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None):
     """Generate transects perpendicular to the centreline.
-    distances_m: distances from bridge point along the line (negative = upstream)
-    For MVP: given centerline, pick a point at its midpoint as bridge point if necessary.
-    Returns list of (transect LineString, station_m)
+
+    Stations are measured from the nearest point on the centreline to the
+    bridge coordinates when provided; otherwise the line midpoint is used.
+    Returns list of (transect LineString, station_m).
     """
     # Work in WebMercator for metric distances
     transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
@@ -254,19 +255,23 @@ def generate_transects(centerline: LineString, distances_m=[0], interval=50, n_e
     proj_coords = [transformer_to_3857.transform(x, y) for (x, y) in centerline.coords]
     proj_line = LineString(proj_coords)
     total_len = proj_line.length
-    # Define station positions along the line: center at midpoint
-    mid_pos = proj_line.project(LineString(proj_coords).interpolate(total_len / 2))
-    stations = []
-    # default distances: generate -n..+n intervals
-    if distances_m == [0]:
-        for i in range(-n_each_side, n_each_side + 1):
-            stations.append(mid_pos + i * interval)
+    if bridge_lon is not None and bridge_lat is not None:
+        bx, by = transformer_to_3857.transform(bridge_lon, bridge_lat)
+        origin = proj_line.project(Point(bx, by))
     else:
-        stations = [mid_pos + d for d in distances_m]
+        origin = total_len / 2.0
+    stations = []
+    if not distances_m:
+        for i in range(-n_each_side, n_each_side + 1):
+            stations.append(origin + i * interval)
+    else:
+        stations = [origin + d for d in distances_m]
 
     transects = []
     half_len = length_m / 2.0
     for s in stations:
+        offset = s - origin
+        s = min(max(s, 0.0), total_len)
         pt = proj_line.interpolate(s)
         # get line direction (tangent) at this location by sampling nearby
         delta = 1.0
@@ -291,7 +296,7 @@ def generate_transects(centerline: LineString, distances_m=[0], interval=50, n_e
         a_ll = transformer_to_4326.transform(a[0], a[1])
         b_ll = transformer_to_4326.transform(b[0], b[1])
         transect_line = LineString([a_ll, b_ll])
-        transects.append((transect_line, s - mid_pos))
+        transects.append((transect_line, offset))
     return transects
 
 # Sample DEM along a LineString
@@ -400,7 +405,126 @@ def plot_cross_section(dists, elevs, out_png):
     plt.savefig(out_png)
     plt.close()
 
-# Main CLI
+class HydroScreenError(Exception):
+    """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
+
+
+def run_screening(
+    lat,
+    lon,
+    dem=None,
+    wcs_base=None,
+    wcs_layer=None,
+    outdir="outputs",
+    buffer=200.0,
+    interval=50.0,
+    n_each_side=3,
+    length=200.0,
+    mannings_n=0.035,
+    slope=0.001,
+):
+    """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    dem_path = dem
+    temp_dir = None
+    buffer_m = max(buffer, 200.0)
+    bbox = bbox_from_point(lat, lon, buffer_m)
+
+    if dem_path is None:
+        temp_dir = tempfile.mkdtemp(prefix="hydroscreen_")
+        out_tif = os.path.join(temp_dir, "dem.tif")
+        if wcs_base and wcs_layer:
+            logging.info("Attempting user-supplied WCS for bbox (buffer %sm)", buffer_m)
+            ok = download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif)
+            if ok and _raster_covers_bbox(out_tif, bbox):
+                dem_path = out_tif
+            elif ok:
+                logging.info(
+                    "WCS returned a raster but it does not fully cover the %sm buffer; continuing LINZ discovery.",
+                    buffer_m,
+                )
+        if dem_path is None:
+            logging.info("Searching LINZ data catalog for DEM covering the location (buffer %sm)...", buffer_m)
+            linz_out = os.path.join(temp_dir, "linz_dem.tif")
+            found = find_linz_dem(lat, lon, buffer_m, linz_out)
+            if found:
+                dem_path = found
+
+    if dem_path is None:
+        raise HydroScreenError(
+            "No DEM available. Provide a local GeoTIFF, a valid WCS, or a LINZ resource covering this location."
+        )
+
+    if not _raster_covers_bbox(dem_path, bbox):
+        raise HydroScreenError(
+            "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
+        )
+
+    logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
+    centerline = query_osm_waterway(lat, lon, radius_m=500)
+    used_synthetic_centerline = centerline is None
+    if centerline is None:
+        logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
+        centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
+
+    transects = generate_transects(
+        centerline,
+        interval=interval,
+        n_each_side=n_each_side,
+        length_m=length,
+        bridge_lon=lon,
+        bridge_lat=lat,
+    )
+    logging.info("Generated %d transects", len(transects))
+
+    summary = []
+    transect_features = []
+    for i, (tran, offset) in enumerate(transects):
+        dists, elevs = sample_dem_along_line(dem_path, tran, n_points=201)
+        stats = basic_hydraulic_checks(dists, elevs, mannings_n=mannings_n, slope=slope)
+        df = pd.DataFrame({"distance_m": dists, "elevation_m": elevs})
+        csv_path = outdir / f"transect_{i+1}.csv"
+        df.to_csv(csv_path, index=False)
+        png_path = outdir / f"transect_{i+1}.png"
+        plot_cross_section(dists, elevs, png_path)
+        stats.update({
+            "transect": i + 1,
+            "offset_m": float(offset),
+            "csv": str(csv_path),
+            "plot": str(png_path),
+        })
+        summary.append(stats)
+        transect_features.append({
+            "transect": i + 1,
+            "offset_m": float(offset),
+            "coords": [[x, y] for x, y in tran.coords],
+            "csv": csv_path.name,
+            "plot": png_path.name,
+        })
+
+    summary_df = pd.DataFrame(summary)
+    summary_path = outdir / "summary.xlsx"
+    summary_df.to_excel(summary_path, index=False)
+    logging.info("Wrote summary to %s", summary_path)
+
+    if temp_dir:
+        logging.info("Temporary DEM stored in %s", temp_dir)
+    logging.info("Done")
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "outdir": str(outdir),
+        "summary": summary,
+        "summary_xlsx": summary_path.name,
+        "centerline": [[x, y] for x, y in centerline.coords],
+        "transects": transect_features,
+        "used_synthetic_centerline": used_synthetic_centerline,
+        "temp_dem": temp_dir,
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(description='Hydraulic screening MVP')
@@ -417,75 +541,24 @@ def main():
     parser.add_argument('--mannings_n', type=float, default=0.035, help="Manning's n for velocity estimate")
     parser.add_argument('--slope', type=float, default=0.001, help='Channel slope for Manning estimate')
     args = parser.parse_args()
-
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    dem_path = args.dem
-    temp_dir = None
-    # enforce a minimum 200 m buffer around the point to ensure bridge area coverage
-    buffer_m = max(args.buffer, 200.0)
-
-    if dem_path is None:
-        temp_dir = tempfile.mkdtemp(prefix="hydroscreen_")
-        out_tif = os.path.join(temp_dir, 'dem.tif')
-        bbox = bbox_from_point(args.lat, args.lon, buffer_m)
-        # 1) If user supplied a WCS base/layer, try that first
-        if args.wcs_base and args.wcs_layer:
-            logging.info('Attempting user-supplied WCS for bbox (buffer %sm)', buffer_m)
-            ok = download_wcs_getcoverage(args.wcs_base, args.wcs_layer, bbox, out_tif)
-            if ok and _raster_covers_bbox(out_tif, bbox):
-                dem_path = out_tif
-            elif ok:
-                logging.info('WCS returned a raster but it does not fully cover the %sm buffer; continuing LINZ discovery.', buffer_m)
-        # 2) Attempt automatic LINZ discovery & download
-        if dem_path is None:
-            logging.info('Searching LINZ data catalog for DEM covering the location (buffer %sm)...', buffer_m)
-            linz_out = os.path.join(temp_dir, 'linz_dem.tif')
-            found = find_linz_dem(args.lat, args.lon, buffer_m, linz_out)
-            if found:
-                dem_path = found
-
-    if dem_path is None:
-        logging.info('No DEM available. The tool requires a DEM (local GeoTIFF), a valid WCS, or a LINZ resource. Exiting.')
+    try:
+        run_screening(
+            lat=args.lat,
+            lon=args.lon,
+            dem=args.dem,
+            wcs_base=args.wcs_base,
+            wcs_layer=args.wcs_layer,
+            outdir=args.outdir,
+            buffer=args.buffer,
+            interval=args.interval,
+            n_each_side=args.n_each_side,
+            length=args.length,
+            mannings_n=args.mannings_n,
+            slope=args.slope,
+        )
+    except HydroScreenError as exc:
+        logging.error("%s", exc)
         sys.exit(1)
-
-    # Query OSM for centreline
-    logging.info('Querying OSM for waterway near lat=%s lon=%s', args.lat, args.lon)
-    centerline = query_osm_waterway(args.lat, args.lon, radius_m=500)
-    if centerline is None:
-        logging.warning('No OSM waterway found within 500 m. Using a synthetic centreline (line through point).')
-        # synthetic small centreline along E-W of length 1 km
-        centerline = LineString([(args.lon - 0.005, args.lat), (args.lon + 0.005, args.lat)])
-
-    transects = generate_transects(centerline, distances_m=[0], interval=args.interval, n_each_side=args.n_each_side, length_m=args.length)
-    logging.info('Generated %d transects', len(transects))
-
-    summary = []
-    for i, (tran, offset) in enumerate(transects):
-        dists, elevs = sample_dem_along_line(dem_path, tran, n_points=201)
-        # drop nan segments and basic stats
-        stats = basic_hydraulic_checks(dists, elevs, mannings_n=args.mannings_n, slope=args.slope)
-        # save CSV
-        df = pd.DataFrame({"distance_m": dists, "elevation_m": elevs})
-        csv_path = outdir / f"transect_{i+1}.csv"
-        df.to_csv(csv_path, index=False)
-        # plot
-        png_path = outdir / f"transect_{i+1}.png"
-        plot_cross_section(dists, elevs, png_path)
-        stats.update({"transect": i + 1, "offset_m": float(offset), "csv": str(csv_path), "plot": str(png_path)})
-        summary.append(stats)
-
-    # save summary excel
-    summary_df = pd.DataFrame(summary)
-    summary_path = outdir / "summary.xlsx"
-    summary_df.to_excel(summary_path, index=False)
-    logging.info('Wrote summary to %s', summary_path)
-
-    if temp_dir:
-        # leave temp_dir for inspection by user but print location
-        logging.info('Temporary DEM stored in %s', temp_dir)
-    logging.info('Done')
 
 if __name__ == '__main__':
     main()

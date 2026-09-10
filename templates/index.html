@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HydroBridge — pick a bridge site</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div>
+        <h1>HydroBridge</h1>
+        <p>Hydraulic screening at a bridge site</p>
+      </div>
+    </div>
+    <form id="search-form" class="search" autocomplete="off">
+      <label class="sr-only" for="search-q">Search for a place or bridge</label>
+      <input id="search-q" name="q" type="search" placeholder="Search a place, river, or address…" enterkeyhint="search">
+      <button type="submit">Find</button>
+      <ul id="search-results" class="search-results" hidden></ul>
+    </form>
+  </header>
+
+  <main class="layout">
+    <aside class="panel">
+      <section>
+        <h2>Bridge location</h2>
+        <p class="hint">Click the map, search, or type coordinates. The pin is the site that will be screened.</p>
+        <p id="place-label" class="place">No site selected yet</p>
+        <div class="coords">
+          <label>Latitude
+            <input id="lat" name="lat" type="number" step="0.000001" min="-90" max="90" value="-41.2865">
+          </label>
+          <label>Longitude
+            <input id="lon" name="lon" type="number" step="0.000001" min="-180" max="180" value="174.7762">
+          </label>
+        </div>
+        <div class="row-actions">
+          <button type="button" id="apply-coords" class="secondary">Move pin to coordinates</button>
+          <button type="button" id="wellington" class="ghost">Wellington sample site</button>
+        </div>
+      </section>
+
+      <form id="run-form">
+        <section>
+          <h2>Elevation data</h2>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="sample" checked>
+            Use bundled Wellington sample DEM
+          </label>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="upload">
+            Upload a GeoTIFF DEM
+          </label>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="linz">
+            Try LINZ / WCS for this location
+          </label>
+          <label id="dem-file-wrap" class="file" hidden>
+            DEM file
+            <input id="dem-file" name="dem" type="file" accept=".tif,.tiff,image/tiff">
+          </label>
+          <div id="wcs-wrap" hidden>
+            <label>WCS base URL
+              <input name="wcs_base" type="url" placeholder="https://…">
+            </label>
+            <label>WCS layer
+              <input name="wcs_layer" type="text" placeholder="coverage id">
+            </label>
+          </div>
+        </section>
+
+        <details class="advanced">
+          <summary>Screening options</summary>
+          <label>Transect interval (m)
+            <input name="interval" type="number" step="1" min="1" value="50">
+          </label>
+          <label>Transects each side
+            <input name="n_each_side" type="number" step="1" min="0" max="10" value="3">
+          </label>
+          <label>Transect length (m)
+            <input name="length" type="number" step="1" min="10" value="200">
+          </label>
+          <label>Manning’s n
+            <input name="mannings_n" type="number" step="0.001" min="0.001" value="0.035">
+          </label>
+          <label>Channel slope
+            <input name="slope" type="number" step="0.0001" min="0" value="0.001">
+          </label>
+        </details>
+
+        <button type="submit" id="run-btn" class="primary">Run screening at this site</button>
+        <p id="status" class="status" role="status"></p>
+      </form>
+    </aside>
+
+    <section class="map-wrap">
+      <div id="map" role="application" aria-label="Map for choosing a bridge location"></div>
+    </section>
+  </main>
+
+  <section id="results" class="results" hidden>
+    <div class="results-head">
+      <h2>Screening results</h2>
+      <a id="summary-link" href="#" hidden>Download summary.xlsx</a>
+    </div>
+    <p id="results-note" class="hint"></p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Transect</th>
+            <th>Offset (m)</th>
+            <th>Width (m)</th>
+            <th>Area (m²)</th>
+            <th>Mean depth (m)</th>
+            <th>Velocity (m/s)</th>
+            <th>Discharge (m³/s)</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+    <div id="plots" class="plots"></div>
+  </section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

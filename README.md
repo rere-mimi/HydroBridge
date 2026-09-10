@@ -21,7 +21,17 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends gdal-bin libgdal-dev libspatialindex-dev
 ```
 
-## Quick usage
+## Web interface
+
+The easiest way to choose a bridge site is the map UI: click the map, search for a place, or type latitude/longitude.
+
+```bash
+.venv/bin/python app.py
+```
+
+Then open http://127.0.0.1:5050. The pin is the bridge location that will be screened. The bundled sample DEM covers Wellington Harbour; upload a GeoTIFF or use LINZ/WCS for other sites.
+
+## Command line
 
 If LINZ public WCS is available for your dataset, supply the WCS base URL and layer name. Otherwise provide a local GeoTIFF DEM with `--dem`.
 
@@ -57,6 +67,7 @@ LINZ hosts NZ DEM products (NZDEM, regional LiDAR) and some services are availab
 
 ## Files
 
-- `hydroscreen.py` — main CLI
+- `app.py` — map-based web UI for choosing a bridge site
+- `hydroscreen.py` — screening engine and CLI
 - `requirements.txt` — Python dependencies
 - `tests/fixtures/sample_dem.tif` — synthetic DEM covering Wellington Harbour for local smoke tests
