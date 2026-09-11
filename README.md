@@ -29,7 +29,7 @@ The easiest way to choose a bridge site is the map UI: click the map, search for
 .venv/bin/python app.py
 ```
 
-Then open http://127.0.0.1:5050. The pin is the bridge location that will be screened. The bundled sample DEM covers Wellington Harbour; upload a GeoTIFF or use LINZ/WCS for other sites.
+Then open http://127.0.0.1:5050. Place the bridge pin, then click **Draw river** and sketch the channel on the map (click or drag). Screening uses that centreline instead of OpenStreetMap. The bundled sample DEM covers Wellington Harbour; upload a GeoTIFF or use LINZ/WCS for other sites.
 
 ## Command line
 

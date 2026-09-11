@@ -252,7 +252,37 @@ button {
 .status.error { color: var(--bad); }
 .status.ok { color: var(--good); }
 
-.map-wrap { min-height: 28rem; }
+.secondary[aria-pressed="true"] {
+  background: var(--water);
+  color: white;
+  border-color: var(--water);
+}
+
+.map-wrap {
+  position: relative;
+  min-height: 28rem;
+}
+
+.map-hint {
+  position: absolute;
+  z-index: 500;
+  left: 0.75rem;
+  right: 0.75rem;
+  top: 0.75rem;
+  margin: 0;
+  padding: 0.45rem 0.7rem;
+  background: rgba(255, 252, 247, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  color: var(--water-dark);
+  font-size: 0.86rem;
+  pointer-events: none;
+}
+
+body.mode-draw #map {
+  cursor: crosshair;
+}
+
 #map { height: 100%; min-height: 28rem; }
 
 .results {

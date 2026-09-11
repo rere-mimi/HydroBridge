@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -128,6 +129,19 @@ def run():
     wcs_base = (request.form.get("wcs_base") or "").strip() or None
     wcs_layer = (request.form.get("wcs_layer") or "").strip() or None
 
+    centerline_coords = None
+    raw_centerline = (request.form.get("centerline") or "").strip()
+    if raw_centerline:
+        try:
+            parsed = json.loads(raw_centerline)
+        except json.JSONDecodeError:
+            return jsonify({"error": "The drawn river line could not be read. Clear it and draw again."}), 400
+        if not isinstance(parsed, list):
+            return jsonify({"error": "The river centreline must be a list of points."}), 400
+        if len(parsed) > 500:
+            return jsonify({"error": "The drawn river line has too many points. Clear it and draw a simpler line."}), 400
+        centerline_coords = parsed
+
     try:
         result = run_screening(
             lat=lat,
@@ -141,6 +155,7 @@ def run():
             length=length,
             mannings_n=mannings_n,
             slope=slope,
+            centerline_coords=centerline_coords,
         )
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -166,6 +181,7 @@ def run():
         "run_id": run_id,
         "lat": lat,
         "lon": lon,
+        "centerline_source": result["centerline_source"],
         "used_synthetic_centerline": result["used_synthetic_centerline"],
         "centerline": result["centerline"],
         "transects": [

@@ -1,5 +1,7 @@
 const WELLINGTON = { lat: -41.2865, lon: 174.7762, zoom: 14 };
 const placeLabel = document.getElementById("place-label");
+const lineLabel = document.getElementById("line-label");
+const mapHint = document.getElementById("map-hint");
 const latInput = document.getElementById("lat");
 const lonInput = document.getElementById("lon");
 const searchForm = document.getElementById("search-form");
@@ -15,6 +17,11 @@ const plotsEl = document.getElementById("plots");
 const summaryLink = document.getElementById("summary-link");
 const demFileWrap = document.getElementById("dem-file-wrap");
 const wcsWrap = document.getElementById("wcs-wrap");
+const modePinBtn = document.getElementById("mode-pin");
+const modeDrawBtn = document.getElementById("mode-draw");
+const undoBtn = document.getElementById("undo-vertex");
+const clearBtn = document.getElementById("clear-line");
+const snapBtn = document.getElementById("snap-pin");
 
 const map = L.map("map").setView([WELLINGTON.lat, WELLINGTON.lon], WELLINGTON.zoom);
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -23,8 +30,14 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 }).addTo(map);
 
 const overlay = L.layerGroup().addTo(map);
+const draftLine = L.polyline([], { color: "#1f6f8b", weight: 5, opacity: 0.95 }).addTo(map);
+const vertexLayer = L.layerGroup().addTo(map);
 let marker = L.marker([WELLINGTON.lat, WELLINGTON.lon], { draggable: true }).addTo(map);
 marker.bindPopup("Bridge site").openPopup();
+
+let mode = "pin";
+let drawnLatLngs = [];
+let drawingStroke = false;
 
 function setStatus(message, kind) {
   statusEl.textContent = message || "";
@@ -41,6 +54,70 @@ function currentLatLon() {
     lat: Number(latInput.value),
     lon: Number(lonInput.value),
   };
+}
+
+function centerlinePayload() {
+  if (drawnLatLngs.length < 2) return null;
+  return drawnLatLngs.map((ll) => [ll.lng, ll.lat]);
+}
+
+function refreshLineLabel() {
+  const n = drawnLatLngs.length;
+  undoBtn.disabled = n === 0;
+  clearBtn.disabled = n === 0;
+  snapBtn.disabled = n < 2;
+  if (n === 0) {
+    lineLabel.textContent = "No river line drawn yet — OSM will be used if available";
+  } else if (n === 1) {
+    lineLabel.textContent = "1 point placed — click again to start the river line";
+  } else {
+    lineLabel.textContent = `Drawn river centreline · ${n} points`;
+  }
+}
+
+function redrawDraft() {
+  draftLine.setLatLngs(drawnLatLngs);
+  vertexLayer.clearLayers();
+  drawnLatLngs.forEach((ll) => {
+    L.circleMarker(ll, {
+      radius: 5,
+      color: "#13485c",
+      fillColor: "#f4d2b0",
+      fillOpacity: 1,
+      weight: 2,
+    }).addTo(vertexLayer);
+  });
+  refreshLineLabel();
+}
+
+function addVertex(latlng) {
+  if (drawnLatLngs.length) {
+    const last = drawnLatLngs[drawnLatLngs.length - 1];
+    if (map.distance(last, latlng) < 4) return;
+  }
+  if (drawnLatLngs.length >= 500) {
+    setStatus("The river line has enough points. Switch back to Place bridge, or undo.", "error");
+    return;
+  }
+  drawnLatLngs.push(L.latLng(latlng.lat, latlng.lng));
+  redrawDraft();
+}
+
+function setMode(next) {
+  mode = next;
+  document.body.classList.toggle("mode-draw", mode === "draw");
+  modePinBtn.setAttribute("aria-pressed", String(mode === "pin"));
+  modeDrawBtn.setAttribute("aria-pressed", String(mode === "draw"));
+  if (mode === "draw") {
+    map.dragging.disable();
+    map.doubleClickZoom.disable();
+    mapHint.textContent = "Click or drag along the river. Double-click when the line is done.";
+  } else {
+    map.dragging.enable();
+    map.doubleClickZoom.enable();
+    drawingStroke = false;
+    mapHint.textContent = "Click the map to place the bridge pin.";
+  }
 }
 
 async function refreshPlaceName(lat, lon) {
@@ -69,9 +146,31 @@ function setLocation(lat, lon, { fly = false, zoom } = {}) {
   refreshPlaceName(Number(lat), Number(lon));
 }
 
+function nearestOnDrawnLine(lat, lon) {
+  if (drawnLatLngs.length < 2) return null;
+  const origin = L.latLng(lat, lon);
+  let best = drawnLatLngs[0];
+  let bestDist = map.distance(origin, best);
+  for (let i = 1; i < drawnLatLngs.length; i += 1) {
+    const a = drawnLatLngs[i - 1];
+    const b = drawnLatLngs[i];
+    const steps = 8;
+    for (let s = 0; s <= steps; s += 1) {
+      const t = s / steps;
+      const candidate = L.latLng(a.lat + (b.lat - a.lat) * t, a.lng + (b.lng - a.lng) * t);
+      const dist = map.distance(origin, candidate);
+      if (dist < bestDist) {
+        best = candidate;
+        bestDist = dist;
+      }
+    }
+  }
+  return best;
+}
+
 function drawRunGeometry(payload) {
   overlay.clearLayers();
-  if (payload.centerline && payload.centerline.length) {
+  if (drawnLatLngs.length < 2 && payload.centerline && payload.centerline.length) {
     const line = payload.centerline.map(([lon, lat]) => [lat, lon]);
     L.polyline(line, { color: "#1f6f8b", weight: 4, opacity: 0.9 }).addTo(overlay);
   }
@@ -85,10 +184,12 @@ function renderResults(payload) {
   resultsEl.hidden = false;
   resultsBody.innerHTML = "";
   plotsEl.innerHTML = "";
-  if (payload.used_synthetic_centerline) {
-    resultsNote.textContent = "No OpenStreetMap waterway was found within 500 m, so a short east–west centreline through the pin was used.";
+  if (payload.centerline_source === "drawn") {
+    resultsNote.textContent = "Transects follow the river centreline you drew, centred on the bridge pin.";
+  } else if (payload.used_synthetic_centerline) {
+    resultsNote.textContent = "No OpenStreetMap waterway was found within 500 m, so a short east–west centreline through the pin was used. Draw the river on the map for a better result.";
   } else {
-    resultsNote.textContent = "Transects are drawn perpendicular to the nearby waterway, centred on the selected bridge pin.";
+    resultsNote.textContent = "Transects follow a nearby OpenStreetMap waterway, centred on the selected bridge pin.";
   }
   summaryLink.hidden = !payload.summary_xlsx;
   summaryLink.href = payload.summary_xlsx || "#";
@@ -121,12 +222,61 @@ function hideSearchResults() {
 }
 
 map.on("click", (event) => {
+  if (mode === "draw") {
+    addVertex(event.latlng);
+    return;
+  }
   setLocation(event.latlng.lat, event.latlng.lng);
+});
+
+map.on("dblclick", (event) => {
+  if (mode !== "draw") return;
+  L.DomEvent.stop(event);
+  if (drawnLatLngs.length >= 2) setMode("pin");
+});
+
+map.on("mousedown", (event) => {
+  if (mode !== "draw" || event.originalEvent.button !== 0) return;
+  drawingStroke = true;
+  addVertex(event.latlng);
+});
+
+map.on("mousemove", (event) => {
+  if (mode !== "draw" || !drawingStroke) return;
+  addVertex(event.latlng);
+});
+
+map.on("mouseup", () => {
+  drawingStroke = false;
+});
+
+map.getContainer().addEventListener("mouseleave", () => {
+  drawingStroke = false;
 });
 
 marker.on("dragend", () => {
   const pos = marker.getLatLng();
   setLocation(pos.lat, pos.lng);
+});
+
+modePinBtn.addEventListener("click", () => setMode("pin"));
+modeDrawBtn.addEventListener("click", () => setMode("draw"));
+
+undoBtn.addEventListener("click", () => {
+  drawnLatLngs.pop();
+  redrawDraft();
+});
+
+clearBtn.addEventListener("click", () => {
+  drawnLatLngs = [];
+  redrawDraft();
+});
+
+snapBtn.addEventListener("click", () => {
+  const { lat, lon } = currentLatLon();
+  const snapped = nearestOnDrawnLine(lat, lon);
+  if (!snapped) return;
+  setLocation(snapped.lat, snapped.lng, { fly: true });
 });
 
 document.getElementById("apply-coords").addEventListener("click", () => {
@@ -203,6 +353,8 @@ runForm.addEventListener("submit", async (event) => {
   const body = new FormData(runForm);
   body.set("lat", String(lat));
   body.set("lon", String(lon));
+  const drawn = centerlinePayload();
+  if (drawn) body.set("centerline", JSON.stringify(drawn));
   runBtn.disabled = true;
   setStatus("Running screening… this can take a few seconds.");
   try {
@@ -213,6 +365,7 @@ runForm.addEventListener("submit", async (event) => {
       return;
     }
     setStatus("Screening complete.", "ok");
+    setMode("pin");
     drawRunGeometry(data);
     renderResults(data);
     marker.setLatLng([data.lat, data.lon]);
@@ -224,3 +377,4 @@ runForm.addEventListener("submit", async (event) => {
 });
 
 refreshPlaceName(WELLINGTON.lat, WELLINGTON.lon);
+refreshLineLabel();

@@ -409,6 +409,32 @@ class HydroScreenError(Exception):
     """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
 
 
+def centerline_from_coords(coords):
+    """Build a river centreline from [[lon, lat], ...] vertices."""
+    if not coords or len(coords) < 2:
+        raise HydroScreenError("Draw at least two points along the river centreline.")
+    points = []
+    for item in coords:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            raise HydroScreenError("Each centreline point needs a longitude and latitude.")
+        try:
+            lon = float(item[0])
+            lat = float(item[1])
+        except (TypeError, ValueError) as exc:
+            raise HydroScreenError("Centreline coordinates must be numbers.") from exc
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            raise HydroScreenError("Centreline coordinates are out of range.")
+        if points and points[-1] == (lon, lat):
+            continue
+        points.append((lon, lat))
+    if len(points) < 2:
+        raise HydroScreenError("The drawn river line is too short. Add more points along the channel.")
+    line = LineString(points)
+    if line.length <= 0:
+        raise HydroScreenError("The drawn river line has no length. Draw along the channel.")
+    return line
+
+
 def run_screening(
     lat,
     lon,
@@ -422,6 +448,7 @@ def run_screening(
     length=200.0,
     mannings_n=0.035,
     slope=0.001,
+    centerline_coords=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
     outdir = Path(outdir)
@@ -462,12 +489,19 @@ def run_screening(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
 
-    logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
-    centerline = query_osm_waterway(lat, lon, radius_m=500)
-    used_synthetic_centerline = centerline is None
-    if centerline is None:
-        logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
-        centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
+    if centerline_coords:
+        logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
+        centerline = centerline_from_coords(centerline_coords)
+        centerline_source = "drawn"
+    else:
+        logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
+        centerline = query_osm_waterway(lat, lon, radius_m=500)
+        if centerline is None:
+            logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
+            centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
+            centerline_source = "synthetic"
+        else:
+            centerline_source = "osm"
 
     transects = generate_transects(
         centerline,
@@ -521,7 +555,8 @@ def run_screening(
         "summary_xlsx": summary_path.name,
         "centerline": [[x, y] for x, y in centerline.coords],
         "transects": transect_features,
-        "used_synthetic_centerline": used_synthetic_centerline,
+        "centerline_source": centerline_source,
+        "used_synthetic_centerline": centerline_source == "synthetic",
         "temp_dem": temp_dir,
     }
 

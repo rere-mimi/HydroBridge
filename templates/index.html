@@ -44,6 +44,21 @@
         </div>
       </section>
 
+      <section>
+        <h2>River centreline</h2>
+        <p class="hint">Switch to Draw river, then click or drag along the channel. Transects follow this line instead of OpenStreetMap.</p>
+        <p id="line-label" class="place">No river line drawn yet — OSM will be used if available</p>
+        <div class="row-actions">
+          <button type="button" id="mode-pin" class="secondary" aria-pressed="true">Place bridge</button>
+          <button type="button" id="mode-draw" class="secondary" aria-pressed="false">Draw river</button>
+        </div>
+        <div class="row-actions">
+          <button type="button" id="undo-vertex" class="ghost" disabled>Undo last point</button>
+          <button type="button" id="clear-line" class="ghost" disabled>Clear line</button>
+          <button type="button" id="snap-pin" class="ghost" disabled>Snap pin to river</button>
+        </div>
+      </section>
+
       <form id="run-form">
         <section>
           <h2>Elevation data</h2>
@@ -98,7 +113,8 @@
     </aside>
 
     <section class="map-wrap">
-      <div id="map" role="application" aria-label="Map for choosing a bridge location"></div>
+      <p id="map-hint" class="map-hint">Click the map to place the bridge pin.</p>
+      <div id="map" role="application" aria-label="Map for choosing a bridge location and drawing the river"></div>
     </section>
   </main>
 
