@@ -144,9 +144,10 @@ html, body {
   font-size: 0.95rem;
 }
 
-.hint, .place, .status {
+.field-help {
+  margin: -0.15rem 0 0.55rem;
   color: var(--muted);
-  font-size: 0.88rem;
+  font-size: 0.78rem;
 }
 
 .place {

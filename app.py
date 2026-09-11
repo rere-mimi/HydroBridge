@@ -119,12 +119,15 @@ def run():
 
     try:
         interval = float(request.form.get("interval") or 50)
-        n_each_side = int(request.form.get("n_each_side") or 3)
+        along_m = float(request.form.get("along") or 300)
         length = float(request.form.get("length") or 200)
+        sample_spacing = float(request.form.get("sample_spacing") or 1)
         mannings_n = float(request.form.get("mannings_n") or 0.035)
         slope = float(request.form.get("slope") or 0.001)
     except (TypeError, ValueError):
         return jsonify({"error": "Screening options must be numbers."}), 400
+    if interval <= 0 or along_m < 0 or length <= 0 or sample_spacing <= 0:
+        return jsonify({"error": "Transect length, spacing, and sample spacing must be greater than 0."}), 400
 
     wcs_base = (request.form.get("wcs_base") or "").strip() or None
     wcs_layer = (request.form.get("wcs_layer") or "").strip() or None
@@ -151,8 +154,9 @@ def run():
             wcs_layer=wcs_layer,
             outdir=str(outdir),
             interval=interval,
-            n_each_side=n_each_side,
+            along_m=along_m,
             length=length,
+            sample_spacing=sample_spacing,
             mannings_n=mannings_n,
             slope=slope,
             centerline_coords=centerline_coords,
@@ -173,6 +177,7 @@ def run():
             "depth_mean_m": row.get("depth_mean_m"),
             "velocity_m_s": row.get("velocity_m_s"),
             "discharge_m3_s": row.get("discharge_m3_s"),
+            "n_samples": row.get("n_samples"),
             "plot": f"/results/{run_id}/{Path(row['plot']).name}",
             "csv": f"/results/{run_id}/{Path(row['csv']).name}",
         })
@@ -183,6 +188,7 @@ def run():
         "lon": lon,
         "centerline_source": result["centerline_source"],
         "used_synthetic_centerline": result["used_synthetic_centerline"],
+        "layout": result.get("layout"),
         "centerline": result["centerline"],
         "transects": [
             {

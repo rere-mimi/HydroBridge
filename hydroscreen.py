@@ -42,6 +42,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+
+class HydroScreenError(Exception):
+    """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
+
 # Utilities
 
 def bbox_from_point(lat, lon, buffer_m):
@@ -240,13 +244,19 @@ out geom;
 
 # Transect generation
 
-def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None):
+def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None, along_m=None):
     """Generate transects perpendicular to the centreline.
 
     Stations are measured from the nearest point on the centreline to the
     bridge coordinates when provided; otherwise the line midpoint is used.
+    If along_m is set, stations run from -along_m/2 to +along_m/2 at `interval`.
     Returns list of (transect LineString, station_m).
     """
+    if interval <= 0:
+        raise HydroScreenError("Transect spacing along the river must be greater than 0.")
+    if length_m <= 0:
+        raise HydroScreenError("Transect length must be greater than 0.")
+
     # Work in WebMercator for metric distances
     transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
@@ -260,12 +270,14 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
         origin = proj_line.project(Point(bx, by))
     else:
         origin = total_len / 2.0
-    stations = []
     if not distances_m:
-        for i in range(-n_each_side, n_each_side + 1):
-            stations.append(origin + i * interval)
-    else:
-        stations = [origin + d for d in distances_m]
+        if along_m is None:
+            along_m = 2.0 * n_each_side * interval
+        half = max(float(along_m), 0.0) / 2.0
+        n = int(math.floor(half / interval + 1e-9))
+        n = min(max(n, 0), 50)
+        distances_m = [i * interval for i in range(-n, n + 1)]
+    stations = [origin + d for d in distances_m]
 
     transects = []
     half_len = length_m / 2.0
@@ -301,16 +313,38 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
 
 # Sample DEM along a LineString
 
-def sample_dem_along_line(dem_path, line: LineString, n_points=201):
-    """Return distances (m from left end) and elevations along the line. Assumes DEM in geographic coords or projected; rasterio handles reprojection with sample using coords in raster CRS.
+def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=None):
+    """Sample DEM elevations at regular metric spacing along a lon/lat line.
+
+    Returns (distances_m, elevations, sample_lonlat).
     """
+    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    proj_line = LineString([transformer_to_3857.transform(x, y) for x, y in line.coords])
+    length = float(proj_line.length)
+    if length <= 0:
+        return np.array([0.0]), np.array([np.nan]), [tuple(line.coords[0])]
+
+    if spacing_m is not None:
+        if spacing_m <= 0:
+            raise HydroScreenError("Sample spacing on the transect must be greater than 0.")
+        distances = list(np.arange(0.0, length, float(spacing_m)))
+        if not distances or (length - distances[-1]) > 1e-6:
+            distances.append(length)
+        if len(distances) > 2001:
+            distances = list(np.linspace(0.0, length, 2001))
+    else:
+        count = max(2, int(n_points or 201))
+        distances = list(np.linspace(0.0, length, count))
+
+    coords = []
+    for dist in distances:
+        pt = proj_line.interpolate(dist)
+        lon, lat = transformer_to_4326.transform(pt.x, pt.y)
+        coords.append((lon, lat))
+
     with rasterio.open(dem_path) as src:
-        # get transformer from lonlat to raster CRS
         transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-        xs = np.linspace(line.coords[0][0], line.coords[-1][0], n_points)
-        ys = np.linspace(line.coords[0][1], line.coords[-1][1], n_points)
-        coords = list(zip(xs, ys))
-        # transform coords to raster CRS
         coords_raster = [transformer.transform(x, y) for x, y in coords]
         elevations = []
         for val in src.sample(coords_raster):
@@ -319,15 +353,7 @@ def sample_dem_along_line(dem_path, line: LineString, n_points=201):
                 elevations.append(np.nan)
             else:
                 elevations.append(float(v))
-        # distances in meters assuming geographic coords: compute great-circle between successive points
-        dists = [0.0]
-        for i in range(1, len(coords)):
-            # approximate by haversine
-            lon1, lat1 = coords[i - 1]
-            lon2, lat2 = coords[i]
-            d = haversine(lon1, lat1, lon2, lat2)
-            dists.append(dists[-1] + d)
-        return np.array(dists), np.array(elevations)
+        return np.array(distances), np.array(elevations), coords
 
 # simple haversine
 
@@ -396,7 +422,9 @@ def basic_hydraulic_checks(dists, elevs, mannings_n=0.035, slope=0.001):
 def plot_cross_section(dists, elevs, out_png):
     plt.figure(figsize=(8, 4))
     plt.plot(dists, elevs, '-k')
-    plt.fill_between(dists, elevs, elevs.min() - 1, color='lightblue')
+    finite = elevs[np.isfinite(elevs)]
+    y_floor = (np.min(finite) - 1) if len(finite) else -1
+    plt.fill_between(dists, elevs, y_floor, color='lightblue')
     plt.xlabel('Distance (m)')
     plt.ylabel('Elevation (m)')
     plt.title('Cross-section')
@@ -404,9 +432,6 @@ def plot_cross_section(dists, elevs, out_png):
     plt.tight_layout()
     plt.savefig(out_png)
     plt.close()
-
-class HydroScreenError(Exception):
-    """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
 
 
 def centerline_from_coords(coords):
@@ -448,6 +473,8 @@ def run_screening(
     length=200.0,
     mannings_n=0.035,
     slope=0.001,
+    along_m=None,
+    sample_spacing=1.0,
     centerline_coords=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
@@ -503,6 +530,9 @@ def run_screening(
         else:
             centerline_source = "osm"
 
+    if along_m is None:
+        along_m = 2.0 * n_each_side * interval
+
     transects = generate_transects(
         centerline,
         interval=interval,
@@ -510,15 +540,23 @@ def run_screening(
         length_m=length,
         bridge_lon=lon,
         bridge_lat=lat,
+        along_m=along_m,
     )
     logging.info("Generated %d transects", len(transects))
 
     summary = []
     transect_features = []
     for i, (tran, offset) in enumerate(transects):
-        dists, elevs = sample_dem_along_line(dem_path, tran, n_points=201)
+        dists, elevs, sample_coords = sample_dem_along_line(
+            dem_path, tran, spacing_m=sample_spacing
+        )
         stats = basic_hydraulic_checks(dists, elevs, mannings_n=mannings_n, slope=slope)
-        df = pd.DataFrame({"distance_m": dists, "elevation_m": elevs})
+        df = pd.DataFrame({
+            "distance_m": dists,
+            "longitude": [xy[0] for xy in sample_coords],
+            "latitude": [xy[1] for xy in sample_coords],
+            "elevation_m": elevs,
+        })
         csv_path = outdir / f"transect_{i+1}.csv"
         df.to_csv(csv_path, index=False)
         png_path = outdir / f"transect_{i+1}.png"
@@ -526,14 +564,24 @@ def run_screening(
         stats.update({
             "transect": i + 1,
             "offset_m": float(offset),
+            "n_samples": int(len(dists)),
+            "sample_spacing_m": float(sample_spacing),
             "csv": str(csv_path),
             "plot": str(png_path),
         })
         summary.append(stats)
+        sample_preview = sample_coords
+        if len(sample_preview) > 80:
+            step = max(1, len(sample_preview) // 80)
+            sample_preview = sample_preview[::step]
+            if sample_preview[-1] != sample_coords[-1]:
+                sample_preview.append(sample_coords[-1])
         transect_features.append({
             "transect": i + 1,
             "offset_m": float(offset),
             "coords": [[x, y] for x, y in tran.coords],
+            "samples": [[x, y] for x, y in sample_preview],
+            "n_samples": int(len(dists)),
             "csv": csv_path.name,
             "plot": png_path.name,
         })
@@ -557,6 +605,13 @@ def run_screening(
         "transects": transect_features,
         "centerline_source": centerline_source,
         "used_synthetic_centerline": centerline_source == "synthetic",
+        "layout": {
+            "along_m": float(along_m) if along_m is not None else None,
+            "interval_m": float(interval),
+            "transect_length_m": float(length),
+            "sample_spacing_m": float(sample_spacing),
+            "n_transects": len(transects),
+        },
         "temp_dem": temp_dir,
     }
 
@@ -570,12 +625,17 @@ def main():
     parser.add_argument('--wcs_layer', type=str, default=None, help='WCS layer/coverage id (optional)')
     parser.add_argument('--outdir', type=str, default='outputs', help='Output directory')
     parser.add_argument('--buffer', type=float, default=200.0, help='Buffer around point for DEM download (m) (min 200 m enforced)')
-    parser.add_argument('--interval', type=float, default=50.0, help='Transect interval (m)')
-    parser.add_argument('--n_each_side', type=int, default=3, help='Number of transects each side of bridge')
-    parser.add_argument('--length', type=float, default=200.0, help='Transect length (m)')
+    parser.add_argument('--interval', type=float, default=50.0, help='Spacing between transects along the river (m)')
+    parser.add_argument('--along', type=float, default=300.0, help='Total length along the river to cover, centred on the bridge (m)')
+    parser.add_argument('--n_each_side', type=int, default=None, help='Deprecated: number of transects each side of the bridge')
+    parser.add_argument('--length', type=float, default=200.0, help='Length of each transect across the river (m)')
+    parser.add_argument('--sample_spacing', type=float, default=1.0, help='Spacing of DEM sample points along each transect (m)')
     parser.add_argument('--mannings_n', type=float, default=0.035, help="Manning's n for velocity estimate")
     parser.add_argument('--slope', type=float, default=0.001, help='Channel slope for Manning estimate')
     args = parser.parse_args()
+    along_m = args.along
+    if args.n_each_side is not None:
+        along_m = 2.0 * args.n_each_side * args.interval
     try:
         run_screening(
             lat=args.lat,
@@ -586,8 +646,10 @@ def main():
             outdir=args.outdir,
             buffer=args.buffer,
             interval=args.interval,
-            n_each_side=args.n_each_side,
+            n_each_side=args.n_each_side if args.n_each_side is not None else 3,
             length=args.length,
+            along_m=along_m,
+            sample_spacing=args.sample_spacing,
             mannings_n=args.mannings_n,
             slope=args.slope,
         )

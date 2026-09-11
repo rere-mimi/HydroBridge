@@ -22,6 +22,7 @@ const modeDrawBtn = document.getElementById("mode-draw");
 const undoBtn = document.getElementById("undo-vertex");
 const clearBtn = document.getElementById("clear-line");
 const snapBtn = document.getElementById("snap-pin");
+const layoutPreview = document.getElementById("layout-preview");
 
 const map = L.map("map").setView([WELLINGTON.lat, WELLINGTON.lon], WELLINGTON.zoom);
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -54,6 +55,22 @@ function currentLatLon() {
     lat: Number(latInput.value),
     lon: Number(lonInput.value),
   };
+}
+
+function updateLayoutPreview() {
+  if (!layoutPreview) return;
+  const along = Number(runForm.along.value);
+  const interval = Number(runForm.interval.value);
+  const length = Number(runForm.length.value);
+  const spacing = Number(runForm.sample_spacing.value);
+  if (!(along >= 0) || !(interval > 0) || !(length > 0) || !(spacing > 0)) {
+    layoutPreview.textContent = "Enter transect length, spacing along the river, and sample spacing.";
+    return;
+  }
+  const nEach = Math.min(50, Math.floor(along / 2 / interval + 1e-9));
+  const nTransects = 2 * nEach + 1;
+  const nSamples = Math.min(2001, Math.floor(length / spacing) + 1);
+  layoutPreview.textContent = `${nTransects} transects along the river · ${nSamples} DEM points on each transect`;
 }
 
 function centerlinePayload() {
@@ -177,6 +194,15 @@ function drawRunGeometry(payload) {
   (payload.transects || []).forEach((tran) => {
     const line = (tran.coords || []).map(([lon, lat]) => [lat, lon]);
     L.polyline(line, { color: "#c45c26", weight: 2, opacity: 0.85 }).addTo(overlay);
+    (tran.samples || []).forEach(([lon, lat]) => {
+      L.circleMarker([lat, lon], {
+        radius: 3,
+        color: "#c45c26",
+        fillColor: "#fff",
+        fillOpacity: 1,
+        weight: 1.5,
+      }).addTo(overlay);
+    });
   });
 }
 
@@ -191,7 +217,10 @@ function renderResults(payload) {
   } else {
     resultsNote.textContent = "Transects follow a nearby OpenStreetMap waterway, centred on the selected bridge pin.";
   }
-  summaryLink.hidden = !payload.summary_xlsx;
+  if (payload.layout) {
+    const extra = `${payload.layout.n_transects} transects along ${payload.layout.along_m ?? "—"} m of river, sampled every ${payload.layout.sample_spacing_m} m.`;
+    resultsNote.textContent = `${resultsNote.textContent} ${extra}`;
+  }
   summaryLink.href = payload.summary_xlsx || "#";
 
   (payload.summary || []).forEach((row) => {
@@ -199,6 +228,7 @@ function renderResults(payload) {
     tr.innerHTML = `
       <td>${row.transect}</td>
       <td>${fmt(row.offset_m, 1)}</td>
+      <td>${row.n_samples ?? "—"}</td>
       <td>${fmt(row.width_m, 1)}</td>
       <td>${fmt(row.area_m2, 1)}</td>
       <td>${fmt(row.depth_mean_m, 2)}</td>
@@ -296,6 +326,7 @@ document.getElementById("wellington").addEventListener("click", () => {
   wcsWrap.hidden = true;
 });
 
+runForm.addEventListener("input", updateLayoutPreview);
 runForm.addEventListener("change", (event) => {
   if (event.target.name !== "dem_source") return;
   demFileWrap.hidden = event.target.value !== "upload";
@@ -378,3 +409,4 @@ runForm.addEventListener("submit", async (event) => {
 
 refreshPlaceName(WELLINGTON.lat, WELLINGTON.lon);
 refreshLineLabel();
+updateLayoutPreview();
