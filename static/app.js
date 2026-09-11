@@ -113,6 +113,7 @@ async function refreshDemOverlay() {
       opacity: 0.5,
       pane: "demPane",
       interactive: false,
+      className: "dem-overlay",
     }).addTo(map);
     if (mode !== "draw") {
       mapHint.textContent = "DEM shown at 50% opacity. Click the map to move the pin.";

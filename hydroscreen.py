@@ -59,6 +59,7 @@ LINZ_LIDAR_1M_BASE = (
 LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
 MAX_DEM_RADIUS_M = 2000.0
 DEM_PREVIEW_MAX_PX = 640
+DEM_PREVIEW_MIN_RADIUS_M = 1500.0
 
 
 class HydroScreenError(Exception):
@@ -324,7 +325,8 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
 
 def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
     """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
-    radius = screening_dem_radius_m(buffer, along_m, length)
+    radius = max(screening_dem_radius_m(buffer, along_m, length), DEM_PREVIEW_MIN_RADIUS_M)
+    radius = min(radius, MAX_DEM_RADIUS_M)
     bbox = bbox_from_point(lat, lon, radius)
     temp_dir = None
     src_path = dem_path
