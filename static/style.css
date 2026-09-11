@@ -30,6 +30,8 @@ html, body {
   clip: rect(0 0 0 0);
 }
 
+[hidden] { display: none !important; }
+
 .topbar {
   display: flex;
   gap: 1.25rem;
@@ -267,7 +269,7 @@ button {
 .map-hint {
   position: absolute;
   z-index: 500;
-  left: 0.75rem;
+  left: 3.6rem;
   right: 0.75rem;
   top: 0.75rem;
   margin: 0;
