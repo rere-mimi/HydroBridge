@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shapely.geometry import Point, LineString
-from shapely.ops import split, nearest_points
+from shapely.ops import split, nearest_points, substring
 from pyproj import Transformer
 
 try:
@@ -251,6 +251,57 @@ def download_linz_lidar_1m(bbox, out_tif):
 def screening_dem_radius_m(buffer, along_m, length):
     needed = max(float(buffer), float(along_m) / 2.0 + float(length) / 2.0 + 50.0)
     return min(max(needed, 200.0), MAX_DEM_RADIUS_M)
+
+
+def centerline_reach(centerline, lon, lat, along_m):
+    """Return the centreline segment around the bridge, length along_m."""
+    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    proj_line = LineString([transformer_to_3857.transform(x, y) for x, y in centerline.coords])
+    if proj_line.length <= 0:
+        return centerline
+    origin = proj_line.project(Point(*transformer_to_3857.transform(lon, lat)))
+    half = max(float(along_m), 50.0) / 2.0
+    start = max(0.0, origin - half)
+    end = min(proj_line.length, origin + half)
+    if end - start < 1.0:
+        start = max(0.0, origin - 25.0)
+        end = min(proj_line.length, origin + 25.0)
+    part = substring(proj_line, start, end)
+    if part.is_empty or part.length <= 0:
+        return centerline
+    coords = [transformer_to_4326.transform(x, y) for x, y in part.coords]
+    if len(coords) < 2:
+        return centerline
+    return LineString(coords)
+
+
+def bbox_from_transects(lon, lat, transects, pad_m=50.0):
+    """Geographic bbox covering the pin and transects, capped around the pin."""
+    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    px, py = transformer_to_3857.transform(lon, lat)
+    xs = [px]
+    ys = [py]
+    for line, _offset in transects:
+        for x, y in line.coords:
+            xx, yy = transformer_to_3857.transform(x, y)
+            xs.append(xx)
+            ys.append(yy)
+    minx = max(min(xs) - pad_m, px - MAX_DEM_RADIUS_M)
+    maxx = min(max(xs) + pad_m, px + MAX_DEM_RADIUS_M)
+    miny = max(min(ys) - pad_m, py - MAX_DEM_RADIUS_M)
+    maxy = min(max(ys) + pad_m, py + MAX_DEM_RADIUS_M)
+    corners = [
+        transformer_to_4326.transform(minx, miny),
+        transformer_to_4326.transform(minx, maxy),
+        transformer_to_4326.transform(maxx, miny),
+        transformer_to_4326.transform(maxx, maxy),
+    ]
+    lons = [c[0] for c in corners]
+    lats = [c[1] for c in corners]
+    radius = max(maxx - px, px - minx, maxy - py, py - miny)
+    return (min(lons), min(lats), max(lons), max(lats)), float(radius)
 
 # OSM centreline via Overpass
 
@@ -555,7 +606,7 @@ def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0):
     if float(distance[-1] - distance[0]) < 1.0:
         return None
     slope, _intercept = np.polyfit(distance.astype(float), elevation.astype(float), 1)
-    return abs(float(slope))
+    return max(abs(float(slope)), 1e-6)
 
 
 def plot_cross_section(dists, elevs, out_png, water_level=None):
@@ -628,12 +679,46 @@ def run_screening(
 
     if along_m is None:
         along_m = 2.0 * n_each_side * interval
+    if mannings_n <= 0:
+        raise HydroScreenError("Manning's n must be greater than 0.")
+    if flow_m3_s < 0:
+        raise HydroScreenError("Flow rate cannot be negative.")
+
+    if centerline_coords:
+        logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
+        centerline = centerline_from_coords(centerline_coords)
+        centerline_source = "drawn"
+    else:
+        logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
+        centerline = query_osm_waterway(lat, lon, radius_m=500)
+        if centerline is None:
+            logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
+            centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
+            centerline_source = "synthetic"
+        else:
+            centerline_source = "osm"
+
+    transects = generate_transects(
+        centerline,
+        interval=interval,
+        n_each_side=n_each_side,
+        length_m=length,
+        bridge_lon=lon,
+        bridge_lat=lat,
+        along_m=along_m,
+    )
+    if not transects:
+        raise HydroScreenError("No transects could be generated along the river centreline.")
+    logging.info("Generated %d transects", len(transects))
 
     dem_path = dem
     temp_dir = None
     dem_source_used = "local"
-    buffer_m = screening_dem_radius_m(buffer, along_m, length)
-    bbox = bbox_from_point(lat, lon, buffer_m)
+    bbox, buffer_m = bbox_from_transects(lon, lat, transects)
+    fallback_radius = screening_dem_radius_m(buffer, along_m, length)
+    if buffer_m < 50:
+        bbox = bbox_from_point(lat, lon, fallback_radius)
+        buffer_m = fallback_radius
 
     if dem_path is None:
         temp_dir = tempfile.mkdtemp(prefix="hydroscreen_")
@@ -646,13 +731,12 @@ def run_screening(
                 dem_source_used = "wcs"
             elif ok:
                 logging.info(
-                    "WCS returned a raster but it does not fully cover the %sm buffer; using the LINZ 1m LiDAR DEM.",
-                    buffer_m,
+                    "WCS returned a raster but it does not fully cover the site; using the LINZ 1m LiDAR DEM.",
                 )
         if dem_path is None:
             logging.info(
-                "Clipping New Zealand LiDAR 1m DEM around the site (buffer %sm)",
-                buffer_m,
+                "Clipping New Zealand LiDAR 1m DEM around the site (window ~%sm)",
+                int(buffer_m),
             )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
             try:
@@ -672,49 +756,19 @@ def run_screening(
             "No DEM available. Provide a local GeoTIFF or allow HydroBridge to clip the New Zealand LiDAR 1m DEM."
         )
 
-    if dem_source_used == "local" and not _raster_covers_bbox(dem_path, bbox):
+    if dem_source_used == "local" and not _raster_covers_bbox(dem_path, bbox_from_point(lat, lon, 50)):
         raise HydroScreenError(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
 
-    if centerline_coords:
-        logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
-        centerline = centerline_from_coords(centerline_coords)
-        centerline_source = "drawn"
-    else:
-        logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
-        centerline = query_osm_waterway(lat, lon, radius_m=500)
-        if centerline is None:
-            logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
-            centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
-            centerline_source = "synthetic"
-        else:
-            centerline_source = "osm"
-
-    if mannings_n <= 0:
-        raise HydroScreenError("Manning's n must be greater than 0.")
-    if flow_m3_s < 0:
-        raise HydroScreenError("Flow rate cannot be negative.")
-
-    slope = estimate_centerline_slope(dem_path, centerline, spacing_m=max(sample_spacing, 5.0))
-    if slope is None or slope <= 0:
+    reach = centerline_reach(centerline, lon, lat, along_m)
+    slope = estimate_centerline_slope(dem_path, reach, spacing_m=max(sample_spacing, 5.0))
+    if slope is None:
         raise HydroScreenError(
-            "Could not estimate river slope from the centreline DEM samples. Draw a longer river line over varying ground."
+            "Could not estimate river slope from the centreline DEM samples. "
+            "Draw the river through the bridge pin so it sits on the LiDAR window."
         )
-    if slope < 1e-6:
-        slope = 1e-6
     logging.info("Estimated centreline slope S=%.6f", slope)
-
-    transects = generate_transects(
-        centerline,
-        interval=interval,
-        n_each_side=n_each_side,
-        length_m=length,
-        bridge_lon=lon,
-        bridge_lat=lat,
-        along_m=along_m,
-    )
-    logging.info("Generated %d transects", len(transects))
 
     summary = []
     transect_features = []

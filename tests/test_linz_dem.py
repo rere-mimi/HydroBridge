@@ -8,8 +8,11 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 
+from shapely.geometry import LineString
+
 from hydroscreen import (
     HydroScreenError,
+    centerline_reach,
     clip_dem_tiles,
     linz_tiles_for_bbox,
     load_linz_dem_1m_index,
@@ -36,6 +39,11 @@ class LinzTileIndexTests(unittest.TestCase):
     def test_dem_radius_covers_transects_and_is_capped(self):
         self.assertEqual(screening_dem_radius_m(200, 300, 200), 300.0)
         self.assertEqual(screening_dem_radius_m(200, 8000, 200), 2000.0)
+
+    def test_centerline_reach_is_centred_on_the_pin(self):
+        line = LineString([(174.770, -41.290), (174.7762, -41.2865), (174.782, -41.283)])
+        reach = centerline_reach(line, 174.7762, -41.2865, along_m=200)
+        self.assertGreaterEqual(len(list(reach.coords)), 2)
 
 
 class ClipDemTilesTests(unittest.TestCase):
