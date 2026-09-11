@@ -286,6 +286,40 @@ body.mode-draw #map {
 
 #map { height: 100%; min-height: 28rem; }
 
+.basemap-switch {
+  position: absolute;
+  z-index: 500;
+  left: 0.75rem;
+  bottom: 1.7rem;
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  background: rgba(255, 252, 247, 0.94);
+  box-shadow: var(--shadow);
+}
+
+.basemap-switch button {
+  margin: 0;
+  padding: 0.35rem 0.7rem;
+  border: 0;
+  border-radius: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--water-dark);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.basemap-switch button:last-child {
+  border-right: 0;
+}
+
+.basemap-switch button[aria-pressed="true"] {
+  background: var(--water);
+  color: white;
+}
+
 .results {
   padding: 1.2rem 1.4rem 2rem;
   background: white;

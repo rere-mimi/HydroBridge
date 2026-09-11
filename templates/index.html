@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HydroBridge — pick a bridge site</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=google-basemap">
 </head>
 <body>
   <header class="topbar">
@@ -122,6 +122,11 @@
     <section class="map-wrap">
       <p id="map-hint" class="map-hint">Click the map to place the bridge pin.</p>
       <div id="map" role="application" aria-label="Map for choosing a bridge location and drawing the river"></div>
+      <div class="basemap-switch" role="radiogroup" aria-label="Basemap">
+        <button type="button" data-basemap="map" aria-pressed="true">Map</button>
+        <button type="button" data-basemap="earth" aria-pressed="false">Earth</button>
+        <button type="button" data-basemap="topo" aria-pressed="false">Topo</button>
+      </div>
     </section>
   </main>
 
@@ -155,6 +160,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=google-basemap"></script>
 </body>
 </html>

@@ -24,10 +24,57 @@ const snapBtn = document.getElementById("snap-pin");
 const layoutPreview = document.getElementById("layout-preview");
 
 const map = L.map("map").setView([WELLINGTON.lat, WELLINGTON.lon], WELLINGTON.zoom);
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  attribution: "&copy; OpenStreetMap",
-}).addTo(map);
+
+function googleBasemap(lyrs) {
+  return L.tileLayer("https://{s}.google.com/vt/lyrs=" + lyrs + "&x={x}&y={y}&z={z}", {
+    maxZoom: 21,
+    subdomains: ["mt0", "mt1", "mt2", "mt3"],
+    attribution: "&copy; Google",
+  });
+}
+
+const BASEMAPS = {
+  map: googleBasemap("m"),
+  earth: googleBasemap("y"),
+  topo: googleBasemap("p"),
+};
+const BASEMAP_IDS = ["map", "earth", "topo"];
+let currentBasemapId = "map";
+try {
+  const saved = localStorage.getItem("hydroscreen-basemap");
+  if (BASEMAP_IDS.includes(saved)) currentBasemapId = saved;
+} catch (_err) {
+  /* ignore */
+}
+BASEMAPS[currentBasemapId].addTo(map);
+
+function setBasemap(id) {
+  if (!BASEMAPS[id] || id === currentBasemapId) {
+    syncBasemapButtons();
+    return;
+  }
+  map.removeLayer(BASEMAPS[currentBasemapId]);
+  currentBasemapId = id;
+  BASEMAPS[id].addTo(map);
+  BASEMAPS[id].bringToBack();
+  try {
+    localStorage.setItem("hydroscreen-basemap", id);
+  } catch (_err) {
+    /* ignore */
+  }
+  syncBasemapButtons();
+}
+
+function syncBasemapButtons() {
+  document.querySelectorAll("[data-basemap]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.dataset.basemap === currentBasemapId ? "true" : "false");
+  });
+}
+
+document.querySelectorAll("[data-basemap]").forEach((btn) => {
+  btn.addEventListener("click", () => setBasemap(btn.dataset.basemap));
+});
+syncBasemapButtons();
 
 const overlay = L.layerGroup().addTo(map);
 const draftLine = L.polyline([], { color: "#1f6f8b", weight: 5, opacity: 0.95 }).addTo(map);
