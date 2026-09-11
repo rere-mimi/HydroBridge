@@ -16,6 +16,7 @@ from hydroscreen import (
     clip_dem_tiles,
     linz_tiles_for_bbox,
     load_linz_dem_1m_index,
+    render_dem_overlay_png,
     screening_dem_radius_m,
 )
 
@@ -103,6 +104,40 @@ class ClipDemTilesTests(unittest.TestCase):
                     (1748010.0, 5428960.0, 1748020.0, 5428970.0),
                     str(out_path),
                 )
+
+
+class DemOverlayTests(unittest.TestCase):
+    def test_renders_transparent_png_with_wgs84_bounds(self):
+        west, north = 174.770, -41.280
+        res = 0.0002
+        height, width = 40, 50
+        data = np.zeros((height, width), dtype=np.float32)
+        for row in range(height):
+            data[row, :] = 20.0 + 0.4 * row
+        transform = from_origin(west, north, res, res)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dem.tif"
+            with rasterio.open(
+                path,
+                "w",
+                driver="GTiff",
+                height=height,
+                width=width,
+                count=1,
+                dtype="float32",
+                crs="EPSG:4326",
+                transform=transform,
+                nodata=-9999,
+            ) as dst:
+                dst.write(data, 1)
+            png, bounds = render_dem_overlay_png(
+                str(path),
+                (west + res, north - (height - 2) * res, west + (width - 2) * res, north - res),
+            )
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        out_west, out_south, out_east, out_north = bounds
+        self.assertLess(out_west, out_east)
+        self.assertLess(out_south, out_north)
 
 
 if __name__ == "__main__":

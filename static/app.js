@@ -28,6 +28,9 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
   attribution: "&copy; OpenStreetMap",
 }).addTo(map);
+map.createPane("demPane");
+map.getPane("demPane").style.zIndex = 350;
+map.getPane("demPane").style.pointerEvents = "none";
 
 const overlay = L.layerGroup().addTo(map);
 const draftLine = L.polyline([], { color: "#1f6f8b", weight: 5, opacity: 0.95 }).addTo(map);
@@ -38,6 +41,10 @@ marker.bindPopup("Bridge site").openPopup();
 let mode = "pin";
 let drawnLatLngs = [];
 let drawingStroke = false;
+let demOverlay = null;
+let demOverlayUrl = null;
+let demPreviewTimer = null;
+let demPreviewSeq = 0;
 
 function setStatus(message, kind) {
   statusEl.textContent = message || "";
@@ -49,11 +56,71 @@ function fmt(value, digits) {
   return Number(value).toFixed(digits);
 }
 
-function currentLatLon() {
-  return {
-    lat: Number(latInput.value),
-    lon: Number(lonInput.value),
-  };
+function currentDemSource() {
+  const picked = runForm.querySelector('input[name="dem_source"]:checked');
+  return picked ? picked.value : "linz";
+}
+
+function clearDemOverlay() {
+  if (demOverlay) {
+    map.removeLayer(demOverlay);
+    demOverlay = null;
+  }
+  if (demOverlayUrl) {
+    URL.revokeObjectURL(demOverlayUrl);
+    demOverlayUrl = null;
+  }
+}
+
+function scheduleDemPreview() {
+  clearTimeout(demPreviewTimer);
+  demPreviewTimer = setTimeout(refreshDemOverlay, 400);
+}
+
+async function refreshDemOverlay() {
+  const { lat, lon } = currentLatLon();
+  if (Number.isNaN(lat) || Number.isNaN(lon)) return;
+  const source = currentDemSource();
+  if (source === "upload") {
+    const file = document.getElementById("dem-file");
+    if (!file || !file.files || !file.files[0]) {
+      clearDemOverlay();
+      return;
+    }
+  }
+  const seq = (demPreviewSeq += 1);
+  const body = new FormData();
+  body.set("lat", String(lat));
+  body.set("lon", String(lon));
+  body.set("dem_source", source);
+  body.set("along", runForm.along.value);
+  body.set("length", runForm.length.value);
+  if (source === "upload") {
+    body.set("dem", document.getElementById("dem-file").files[0]);
+  }
+  try {
+    const res = await fetch("/api/dem-preview", { method: "POST", body });
+    const data = await res.json();
+    if (seq !== demPreviewSeq) return;
+    if (!res.ok || !data.png || !data.bounds) {
+      clearDemOverlay();
+      return;
+    }
+    const bytes = Uint8Array.from(atob(data.png), (ch) => ch.charCodeAt(0));
+    clearDemOverlay();
+    demOverlayUrl = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+    demOverlay = L.imageOverlay(demOverlayUrl, data.bounds, {
+      opacity: 0.5,
+      pane: "demPane",
+      interactive: false,
+    }).addTo(map);
+    if (mode !== "draw") {
+      mapHint.textContent = "DEM shown at 50% opacity. Click the map to move the pin.";
+    }
+  } catch (_err) {
+    if (seq !== demPreviewSeq) return;
+    clearDemOverlay();
+  }
 }
 
 function updateLayoutPreview() {
@@ -160,6 +227,7 @@ function setLocation(lat, lon, { fly = false, zoom } = {}) {
   }
   marker.openPopup();
   refreshPlaceName(Number(lat), Number(lon));
+  scheduleDemPreview();
 }
 
 function nearestOnDrawnLine(lat, lon) {
@@ -329,10 +397,21 @@ document.getElementById("wellington").addEventListener("click", () => {
   setLocation(WELLINGTON.lat, WELLINGTON.lon, { fly: true, zoom: WELLINGTON.zoom });
 });
 
-runForm.addEventListener("input", updateLayoutPreview);
+runForm.addEventListener("input", (event) => {
+  updateLayoutPreview();
+  if (event.target && (event.target.name === "along" || event.target.name === "length")) {
+    scheduleDemPreview();
+  }
+});
 runForm.addEventListener("change", (event) => {
-  if (event.target.name !== "dem_source") return;
-  demFileWrap.hidden = event.target.value !== "upload";
+  if (event.target.name === "dem_source") {
+    demFileWrap.hidden = event.target.value !== "upload";
+    scheduleDemPreview();
+    return;
+  }
+  if (event.target.name === "dem" || event.target.name === "along" || event.target.name === "length") {
+    scheduleDemPreview();
+  }
 });
 
 searchForm.addEventListener("submit", async (event) => {
@@ -412,3 +491,4 @@ runForm.addEventListener("submit", async (event) => {
 refreshPlaceName(WELLINGTON.lat, WELLINGTON.lon);
 refreshLineLabel();
 updateLayoutPreview();
+scheduleDemPreview();
