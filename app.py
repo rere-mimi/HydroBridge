@@ -6,13 +6,14 @@ import json
 import logging
 import re
 import secrets
+from base64 import b64encode
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
-from hydroscreen import HydroScreenError, run_screening
+from hydroscreen import HydroScreenError, preview_dem_overlay, run_screening
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DEM = ROOT / "tests" / "fixtures" / "sample_dem.tif"
@@ -82,6 +83,66 @@ def reverse_geocode():
     except Exception as exc:
         logging.warning("Reverse geocode failed: %s", exc)
         return jsonify({"label": None})
+
+
+@app.route("/api/dem-preview", methods=["GET", "POST"])
+def dem_preview():
+    src = request.form if request.method == "POST" else request.args
+    try:
+        lat = float(src.get("lat"))
+        lon = float(src.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid latitude and longitude, or click the map."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
+    dem_source = (src.get("dem_source") or "linz").strip()
+    try:
+        along_m = float(src.get("along") or 300)
+        length = float(src.get("length") or 200)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Screening options must be numbers."}), 400
+    if along_m < 0 or length <= 0:
+        return jsonify({"error": "Transect length and length along the river must be greater than 0."}), 400
+
+    dem_path = None
+    if dem_source == "sample":
+        if not SAMPLE_DEM.exists():
+            return jsonify({"error": "Bundled sample DEM is missing."}), 500
+        dem_path = str(SAMPLE_DEM)
+    elif dem_source == "upload":
+        uploaded = request.files.get("dem")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Choose a GeoTIFF DEM to overlay."}), 400
+        suffix = Path(uploaded.filename).suffix.lower()
+        if suffix not in {".tif", ".tiff"}:
+            return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
+        tmp = Path("/tmp") / f"hydroscreen-preview-{secrets.token_hex(4)}{suffix}"
+        uploaded.save(tmp)
+        dem_path = str(tmp)
+    elif dem_source != "linz":
+        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
+
+    try:
+        result = preview_dem_overlay(
+            lat, lon, dem_path=dem_path, along_m=along_m, length=length
+        )
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("DEM preview failed")
+        return jsonify({"error": f"Could not overlay the DEM: {exc}"}), 500
+    finally:
+        if dem_source == "upload" and dem_path:
+            Path(dem_path).unlink(missing_ok=True)
+
+    west, south, east, north = result["bounds"]
+    return jsonify({
+        "png": b64encode(result["png"]).decode("ascii"),
+        "bounds": [[south, west], [north, east]],
+        "source": result["source"],
+        "radius_m": result["radius_m"],
+        "opacity": 0.5,
+    })
 
 
 @app.post("/api/run")

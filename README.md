@@ -36,7 +36,7 @@ Then open http://127.0.0.1:5050. Place the bridge pin, then click **Draw river**
 - **Sample spacing** — distance between DEM sample points on each transect
 - **Flow rate Q** and **Manning’s n** — water level is raised on each transect until Manning’s equation matches that flow; slope is estimated from the centreline
 
-Elevations default to the nationwide **New Zealand LiDAR 1m DEM** (LINZ layer 121859). HydroBridge downloads only a window around the pin from the public COG tiles. You can still upload a GeoTIFF or use the bundled Wellington sample DEM offline.
+Elevations default to the nationwide **New Zealand LiDAR 1m DEM** (LINZ layer 121859). HydroBridge downloads only a window around the pin from the public COG tiles and draws that DEM on the map at 50% opacity. You can still upload a GeoTIFF or use the bundled Wellington sample DEM offline.
 
 ## Command line
 

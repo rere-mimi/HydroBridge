@@ -30,6 +30,8 @@ html, body {
   clip: rect(0 0 0 0);
 }
 
+[hidden] { display: none !important; }
+
 .topbar {
   display: flex;
   gap: 1.25rem;
@@ -267,7 +269,7 @@ button {
 .map-hint {
   position: absolute;
   z-index: 500;
-  left: 0.75rem;
+  left: 3.6rem;
   right: 0.75rem;
   top: 0.75rem;
   margin: 0;
@@ -285,6 +287,11 @@ body.mode-draw #map {
 }
 
 #map { height: 100%; min-height: 28rem; }
+
+.dem-overlay {
+  outline: 2px solid rgba(31, 111, 139, 0.65);
+  outline-offset: -1px;
+}
 
 .results {
   padding: 1.2rem 1.4rem 2rem;

@@ -14,6 +14,7 @@ Usage examples are in README.md
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -37,11 +38,15 @@ from pyproj import Transformer
 try:
     import rasterio
     from rasterio.merge import merge as raster_merge
-    from rasterio.transform import from_origin
+    from rasterio.transform import from_origin, from_bounds
+    from rasterio.warp import reproject, Resampling, transform_bounds
     from rasterio.io import MemoryFile
 except Exception as e:
     print("rasterio required. Install with: pip install rasterio")
     raise
+
+from matplotlib.colors import LightSource
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -53,6 +58,8 @@ LINZ_LIDAR_1M_BASE = (
 )
 LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
 MAX_DEM_RADIUS_M = 2000.0
+DEM_PREVIEW_MAX_PX = 640
+DEM_PREVIEW_MIN_RADIUS_M = 1500.0
 
 
 class HydroScreenError(Exception):
@@ -181,7 +188,7 @@ def linz_tiles_for_bbox(bbox, tiles=None):
     return sorted(hits)
 
 
-def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0):
+def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=None):
     """Mosaic windowed reads from GeoTIFF URIs into an NZTM clip."""
     _configure_gdal_http()
     west, south, east, north = bounds_2193
@@ -193,11 +200,13 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0):
             datasets.append(rasterio.open(uri))
         if not datasets:
             raise HydroScreenError("No DEM tiles were available to clip.")
-        mosaic, transform = raster_merge(
-            datasets,
-            bounds=(west, south, east, north),
-            nodata=nodata,
-        )
+        merge_kw = {
+            "bounds": (west, south, east, north),
+            "nodata": nodata,
+        }
+        if resolution is not None:
+            merge_kw["res"] = (float(resolution), float(resolution))
+        mosaic, transform = raster_merge(datasets, **merge_kw)
         data = mosaic[0]
         valid = np.isfinite(data) & (data != nodata)
         if not np.any(valid):
@@ -226,7 +235,7 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0):
     return out_tif
 
 
-def download_linz_lidar_1m(bbox, out_tif):
+def download_linz_lidar_1m(bbox, out_tif, resolution=None):
     """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif."""
     codes = linz_tiles_for_bbox(bbox)
     if not codes:
@@ -245,12 +254,100 @@ def download_linz_lidar_1m(bbox, out_tif):
         "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
         ", ".join(codes),
     )
-    return clip_dem_tiles(uris, (west, south, east, north), out_tif)
+    return clip_dem_tiles(uris, (west, south, east, north), out_tif, resolution=resolution)
 
 
 def screening_dem_radius_m(buffer, along_m, length):
     needed = max(float(buffer), float(along_m) / 2.0 + float(length) / 2.0 + 50.0)
     return min(max(needed, 200.0), MAX_DEM_RADIUS_M)
+
+
+def _colorize_elevation(z):
+    """Hillshaded terrain RGBA; nodata / NaN pixels are transparent."""
+    valid = np.isfinite(z)
+    if not np.any(valid):
+        raise HydroScreenError("No elevation values in this preview window.")
+    vmin, vmax = np.nanpercentile(z, [2, 98])
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin = float(np.nanmin(z[valid]))
+        vmax = vmin + 1.0
+    filled = np.where(valid, z, vmin)
+    rgb = LightSource(azdeg=315, altdeg=45).shade(
+        filled,
+        cmap=matplotlib.colormaps["terrain"],
+        vert_exag=2.0,
+        blend_mode="overlay",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    rgba = np.zeros((z.shape[0], z.shape[1], 4), dtype=np.uint8)
+    rgba[..., :3] = (np.clip(rgb[..., :3], 0, 1) * 255).astype(np.uint8)
+    rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
+    return rgba
+
+
+def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
+    """Warp a DEM window to WGS84 and return (png_bytes, (west, south, east, north))."""
+    west, south, east, north = [float(v) for v in bbox_4326]
+    with rasterio.open(dem_path) as src:
+        src_west, src_south, src_east, src_north = transform_bounds(
+            src.crs, "EPSG:4326", *src.bounds, densify_pts=21
+        )
+        west = max(west, src_west)
+        east = min(east, src_east)
+        south = max(south, src_south)
+        north = min(north, src_north)
+        if east <= west or north <= south:
+            raise HydroScreenError("The DEM does not overlap this location.")
+        width = max_px
+        height = max(1, int(round(max_px * (north - south) / max(east - west, 1e-12))))
+        if height > max_px:
+            height = max_px
+            width = max(1, int(round(max_px * (east - west) / max(north - south, 1e-12))))
+        dst_transform = from_bounds(west, south, east, north, width, height)
+        dest = np.full((height, width), np.nan, dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dest,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs="EPSG:4326",
+            resampling=Resampling.bilinear,
+            src_nodata=src.nodata,
+            dst_nodata=np.nan,
+        )
+    rgba = _colorize_elevation(dest)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), (west, south, east, north)
+
+
+def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
+    """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
+    radius = max(screening_dem_radius_m(buffer, along_m, length), DEM_PREVIEW_MIN_RADIUS_M)
+    radius = min(radius, MAX_DEM_RADIUS_M)
+    bbox = bbox_from_point(lat, lon, radius)
+    temp_dir = None
+    src_path = dem_path
+    source = "local"
+    try:
+        if src_path is None:
+            temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
+            src_path = os.path.join(temp_dir, "dem.tif")
+            resolution = max((2.0 * radius) / DEM_PREVIEW_MAX_PX, 2.0)
+            download_linz_lidar_1m(bbox, src_path, resolution=resolution)
+            source = "linz-lidar-1m"
+        png, bounds = render_dem_overlay_png(src_path, bbox)
+        return {
+            "png": png,
+            "bounds": bounds,
+            "source": source,
+            "radius_m": float(radius),
+        }
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def centerline_reach(centerline, lon, lat, along_m):
