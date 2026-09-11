@@ -56,6 +56,13 @@ function fmt(value, digits) {
   return Number(value).toFixed(digits);
 }
 
+function currentLatLon() {
+  return {
+    lat: Number(latInput.value),
+    lon: Number(lonInput.value),
+  };
+}
+
 function currentDemSource() {
   const picked = runForm.querySelector('input[name="dem_source"]:checked');
   return picked ? picked.value : "linz";
