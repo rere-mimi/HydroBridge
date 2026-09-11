@@ -1,8 +1,8 @@
 """
 Hydraulic screening MVP
 - Accepts lat/lon or bridge ID (lat/lon for MVP)
-- Attempts to download DEM from LINZ WCS (public) if wcs_base and wcs_layer supplied
-- Falls back to local DEM if provided with --dem
+- Clips the New Zealand LiDAR 1m DEM (LINZ layer 121859) around the site
+- Falls back to a local DEM if provided with --dem
 - Queries OSM (Overpass) for nearby waterway centreline
 - Generates transects and samples DEM elevations
 - Exports CSV/Excel and plots
@@ -14,6 +14,7 @@ Usage examples are in README.md
 """
 
 import argparse
+import json
 import os
 import sys
 import math
@@ -35,6 +36,7 @@ from pyproj import Transformer
 
 try:
     import rasterio
+    from rasterio.merge import merge as raster_merge
     from rasterio.transform import from_origin
     from rasterio.io import MemoryFile
 except Exception as e:
@@ -44,6 +46,13 @@ except Exception as e:
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+ROOT = Path(__file__).resolve().parent
+LINZ_LIDAR_1M_LAYER = "https://data.linz.govt.nz/layer/121859-new-zealand-lidar-1m-dem/"
+LINZ_LIDAR_1M_BASE = (
+    "https://nz-elevation.s3-ap-southeast-2.amazonaws.com/new-zealand/new-zealand/dem_1m/2193/"
+)
+LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
+MAX_DEM_RADIUS_M = 2000.0
 
 
 class HydroScreenError(Exception):
@@ -140,71 +149,108 @@ def _raster_covers_bbox(dem_path, bbox):
         return False
 
 
-def find_linz_dem(lat, lon, buffer_m, out_tif):
-    """Attempt to discover and download a LINZ DEM that covers the point + buffer.
-    Strategy (MVP): use LINZ CKAN API (package_search) to find datasets with DEM/LiDAR, try GeoTIFF resources first, then WCS resources.
-    Returns path to downloaded DEM (out_tif) on success, or None.
-    """
-    bbox = bbox_from_point(lat, lon, buffer_m)
-    search_url = "https://data.linz.govt.nz/api/3/action/package_search"
-    params = {"q": "NZDEM OR DEM OR LiDAR", "rows": 50}
-    headers = {"User-Agent": "hydroscreen/0.1"}
-    try:
-        r = requests.get(search_url, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        res = r.json()
-        results = res.get("result", {}).get("results", [])
-    except Exception as e:
-        logging.warning("LINZ package_search failed: %s", e)
-        results = []
+def _configure_gdal_http():
+    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+    os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "4")
+    os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
 
-    # try GeoTIFF direct downloads first
-    for pkg in results:
-        for resource in pkg.get("resources", []):
-            url = resource.get("url") or resource.get("link")
-            fmt = (resource.get("format") or "").lower()
-            if not url:
-                continue
-            if url.lower().endswith('.tif') or 'geotiff' in fmt or 'tif' in fmt:
-                logging.info('Attempting direct GeoTIFF download from %s', url)
-                try:
-                    rr = requests.get(url, stream=True, timeout=60)
-                    if rr.status_code == 200:
-                        with open(out_tif, 'wb') as fh:
-                            for chunk in rr.iter_content(8192):
-                                fh.write(chunk)
-                        # verify coverage
-                        if _raster_covers_bbox(out_tif, bbox):
-                            logging.info('Downloaded GeoTIFF covers bbox')
-                            return out_tif
-                        else:
-                            logging.info('Downloaded GeoTIFF does not cover bbox; skipping')
-                            os.remove(out_tif)
-                except Exception as e:
-                    logging.warning('Failed to download GeoTIFF resource: %s', e)
-    # try WCS resources
-    for pkg in results:
-        for resource in pkg.get("resources", []):
-            url = resource.get("url") or resource.get("link")
-            fmt = (resource.get("format") or "").lower()
-            if not url:
-                continue
-            if 'wcs' in url.lower() or fmt == 'wcs':
-                # attempt using resource name as coverage id, then package name
-                coverage_candidates = [resource.get('name'), pkg.get('name'), pkg.get('title')]
-                for cov in coverage_candidates:
-                    if not cov:
-                        continue
-                    logging.info('Attempting WCS GetCoverage: base=%s coverage=%s', url, cov)
-                    try:
-                        ok = download_wcs_getcoverage(url, cov, bbox, out_tif)
-                        if ok and _raster_covers_bbox(out_tif, bbox):
-                            return out_tif
-                        elif ok:
-                            logging.info('WCS returned raster but it does not fully cover bbox')
-                    except Exception as e:
-                        logging.warning('WCS attempt failed for coverage %s: %s', cov, e)
-    return None
+
+def load_linz_dem_1m_index():
+    """Sheet id → geographic bbox for the national 1 m LiDAR DEM tiles."""
+    if not LINZ_LIDAR_1M_INDEX.exists():
+        raise HydroScreenError("Bundled LINZ 1m DEM tile index is missing.")
+    data = json.loads(LINZ_LIDAR_1M_INDEX.read_text())
+    tiles = data.get("tiles") or {}
+    if not tiles:
+        raise HydroScreenError("LINZ 1m DEM tile index is empty.")
+    return tiles
+
+
+def linz_tiles_for_bbox(bbox, tiles=None):
+    """Return Topo50 sheet ids whose geographic bbox intersects bbox (minLon,minLat,maxLon,maxLat)."""
+    minx, miny, maxx, maxy = bbox
+    tiles = tiles if tiles is not None else load_linz_dem_1m_index()
+    hits = []
+    for code, tbbox in tiles.items():
+        if len(tbbox) != 4:
+            continue
+        tminx, tminy, tmaxx, tmaxy = tbbox
+        if tmaxx < minx or tminx > maxx or tmaxy < miny or tminy > maxy:
+            continue
+        hits.append(code)
+    return sorted(hits)
+
+
+def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0):
+    """Mosaic windowed reads from GeoTIFF URIs into an NZTM clip."""
+    _configure_gdal_http()
+    west, south, east, north = bounds_2193
+    if east <= west or north <= south:
+        raise HydroScreenError("Invalid DEM clip window.")
+    datasets = []
+    try:
+        for uri in tile_uris:
+            datasets.append(rasterio.open(uri))
+        if not datasets:
+            raise HydroScreenError("No DEM tiles were available to clip.")
+        mosaic, transform = raster_merge(
+            datasets,
+            bounds=(west, south, east, north),
+            nodata=nodata,
+        )
+        data = mosaic[0]
+        valid = np.isfinite(data) & (data != nodata)
+        if not np.any(valid):
+            raise HydroScreenError(
+                "The New Zealand LiDAR 1m DEM has no elevation values at this site."
+            )
+        profile = {
+            "driver": "GTiff",
+            "height": int(data.shape[0]),
+            "width": int(data.shape[1]),
+            "count": 1,
+            "dtype": data.dtype,
+            "crs": datasets[0].crs or "EPSG:2193",
+            "transform": transform,
+            "nodata": nodata,
+            "compress": "deflate",
+            "tiled": True,
+            "blockxsize": 256,
+            "blockysize": 256,
+        }
+        with rasterio.open(out_tif, "w", **profile) as dst:
+            dst.write(data, 1)
+    finally:
+        for src in datasets:
+            src.close()
+    return out_tif
+
+
+def download_linz_lidar_1m(bbox, out_tif):
+    """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif."""
+    codes = linz_tiles_for_bbox(bbox)
+    if not codes:
+        raise HydroScreenError(
+            "This site is outside the New Zealand LiDAR 1m DEM coverage "
+            f"({LINZ_LIDAR_1M_LAYER})."
+        )
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:2193", always_xy=True)
+    minx, miny, maxx, maxy = bbox
+    x1, y1 = transformer.transform(minx, miny)
+    x2, y2 = transformer.transform(maxx, maxy)
+    west, east = min(x1, x2) - 2.0, max(x1, x2) + 2.0
+    south, north = min(y1, y2) - 2.0, max(y1, y2) + 2.0
+    uris = [f"/vsicurl/{LINZ_LIDAR_1M_BASE}{code}.tiff" for code in codes]
+    logging.info(
+        "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
+        ", ".join(codes),
+    )
+    return clip_dem_tiles(uris, (west, south, east, north), out_tif)
+
+
+def screening_dem_radius_m(buffer, along_m, length):
+    needed = max(float(buffer), float(along_m) / 2.0 + float(length) / 2.0 + 50.0)
+    return min(max(needed, 200.0), MAX_DEM_RADIUS_M)
 
 # OSM centreline via Overpass
 
@@ -580,9 +626,13 @@ def run_screening(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    if along_m is None:
+        along_m = 2.0 * n_each_side * interval
+
     dem_path = dem
     temp_dir = None
-    buffer_m = max(buffer, 200.0)
+    dem_source_used = "local"
+    buffer_m = screening_dem_radius_m(buffer, along_m, length)
     bbox = bbox_from_point(lat, lon, buffer_m)
 
     if dem_path is None:
@@ -593,24 +643,36 @@ def run_screening(
             ok = download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif)
             if ok and _raster_covers_bbox(out_tif, bbox):
                 dem_path = out_tif
+                dem_source_used = "wcs"
             elif ok:
                 logging.info(
-                    "WCS returned a raster but it does not fully cover the %sm buffer; continuing LINZ discovery.",
+                    "WCS returned a raster but it does not fully cover the %sm buffer; using the LINZ 1m LiDAR DEM.",
                     buffer_m,
                 )
         if dem_path is None:
-            logging.info("Searching LINZ data catalog for DEM covering the location (buffer %sm)...", buffer_m)
+            logging.info(
+                "Clipping New Zealand LiDAR 1m DEM around the site (buffer %sm)",
+                buffer_m,
+            )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
-            found = find_linz_dem(lat, lon, buffer_m, linz_out)
-            if found:
-                dem_path = found
+            try:
+                dem_path = download_linz_lidar_1m(bbox, linz_out)
+                dem_source_used = "linz-lidar-1m"
+            except HydroScreenError:
+                raise
+            except Exception as exc:
+                logging.exception("LINZ 1m DEM download failed")
+                raise HydroScreenError(
+                    "Could not download the New Zealand LiDAR 1m DEM. "
+                    f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
+                ) from exc
 
     if dem_path is None:
         raise HydroScreenError(
-            "No DEM available. Provide a local GeoTIFF, a valid WCS, or a LINZ resource covering this location."
+            "No DEM available. Provide a local GeoTIFF or allow HydroBridge to clip the New Zealand LiDAR 1m DEM."
         )
 
-    if not _raster_covers_bbox(dem_path, bbox):
+    if dem_source_used == "local" and not _raster_covers_bbox(dem_path, bbox):
         raise HydroScreenError(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
@@ -628,9 +690,6 @@ def run_screening(
             centerline_source = "synthetic"
         else:
             centerline_source = "osm"
-
-    if along_m is None:
-        along_m = 2.0 * n_each_side * interval
 
     if mannings_n <= 0:
         raise HydroScreenError("Manning's n must be greater than 0.")
@@ -729,6 +788,9 @@ def run_screening(
             "flow_m3_s": float(flow_m3_s),
             "mannings_n": float(mannings_n),
             "slope": float(slope),
+            "dem_source": dem_source_used,
+            "dem_layer": LINZ_LIDAR_1M_LAYER if dem_source_used == "linz-lidar-1m" else None,
+            "dem_buffer_m": float(buffer_m),
         },
         "temp_dem": temp_dir,
     }
@@ -738,7 +800,7 @@ def main():
     parser = argparse.ArgumentParser(description='Hydraulic screening MVP')
     parser.add_argument('--lat', type=float, required=True, help='Bridge latitude in decimal degrees')
     parser.add_argument('--lon', type=float, required=True, help='Bridge longitude in decimal degrees')
-    parser.add_argument('--dem', type=str, default=None, help='Path to local DEM GeoTIFF (optional)')
+    parser.add_argument('--dem', type=str, default=None, help='Path to local DEM GeoTIFF. If omitted, clips the New Zealand LiDAR 1m DEM (LINZ layer 121859).')
     parser.add_argument('--wcs_base', type=str, default=None, help='LINZ WCS base URL (optional)')
     parser.add_argument('--wcs_layer', type=str, default=None, help='WCS layer/coverage id (optional)')
     parser.add_argument('--outdir', type=str, default='outputs', help='Output directory')

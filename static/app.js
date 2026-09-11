@@ -16,7 +16,6 @@ const resultsNote = document.getElementById("results-note");
 const plotsEl = document.getElementById("plots");
 const summaryLink = document.getElementById("summary-link");
 const demFileWrap = document.getElementById("dem-file-wrap");
-const wcsWrap = document.getElementById("wcs-wrap");
 const modePinBtn = document.getElementById("mode-pin");
 const modeDrawBtn = document.getElementById("mode-draw");
 const undoBtn = document.getElementById("undo-vertex");
@@ -220,7 +219,8 @@ function renderResults(payload) {
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects along ${payload.layout.along_m ?? "—"} m of river, sampled every ${payload.layout.sample_spacing_m} m.`;
     const flow = payload.layout.flow_m3_s != null ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${Number(payload.layout.slope).toExponential(2)}.` : "";
-    resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}`;
+    const dem = payload.layout.dem_source === "linz-lidar-1m" ? " Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859)." : "";
+    resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}${dem}`;
   }
   summaryLink.hidden = !payload.summary_xlsx;
   summaryLink.href = payload.summary_xlsx || "#";
@@ -327,17 +327,12 @@ document.getElementById("apply-coords").addEventListener("click", () => {
 
 document.getElementById("wellington").addEventListener("click", () => {
   setLocation(WELLINGTON.lat, WELLINGTON.lon, { fly: true, zoom: WELLINGTON.zoom });
-  const sample = runForm.querySelector('input[name="dem_source"][value="sample"]');
-  if (sample) sample.checked = true;
-  demFileWrap.hidden = true;
-  wcsWrap.hidden = true;
 });
 
 runForm.addEventListener("input", updateLayoutPreview);
 runForm.addEventListener("change", (event) => {
   if (event.target.name !== "dem_source") return;
   demFileWrap.hidden = event.target.value !== "upload";
-  wcsWrap.hidden = event.target.value !== "linz";
 });
 
 searchForm.addEventListener("submit", async (event) => {

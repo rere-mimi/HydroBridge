@@ -250,7 +250,7 @@ button {
   font-weight: 600;
 }
 
-.status.error { color: var(--bad); }
+.hint a { color: var(--water); }
 .status.ok { color: var(--good); }
 
 .secondary[aria-pressed="true"] {

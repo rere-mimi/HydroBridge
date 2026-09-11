@@ -94,7 +94,7 @@ def run():
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
 
-    dem_source = (request.form.get("dem_source") or "sample").strip()
+    dem_source = (request.form.get("dem_source") or "linz").strip()
     dem_path = None
     uploaded = request.files.get("dem")
     run_id = _new_run_id()
@@ -103,7 +103,7 @@ def run():
 
     if dem_source == "upload":
         if uploaded is None or not uploaded.filename:
-            return jsonify({"error": "Choose a GeoTIFF DEM to upload, or use the Wellington sample DEM."}), 400
+            return jsonify({"error": "Choose a GeoTIFF DEM to upload, or use the New Zealand LiDAR 1m DEM."}), 400
         suffix = Path(uploaded.filename).suffix.lower()
         if suffix not in {".tif", ".tiff"}:
             return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
@@ -114,8 +114,10 @@ def run():
         if not SAMPLE_DEM.exists():
             return jsonify({"error": "Bundled sample DEM is missing."}), 500
         dem_path = str(SAMPLE_DEM)
-    else:
+    elif dem_source == "linz":
         dem_path = None
+    else:
+        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
 
     try:
         interval = float(request.form.get("interval") or 50)
