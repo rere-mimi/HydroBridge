@@ -58,7 +58,7 @@ Local DEM:
 2. Query OSM (Overpass) for nearby waterways to get a centreline. If none is found, fall back to a synthetic east-west line through the point. The map UI can supply a drawn centreline instead.
 3. Generate transects perpendicular to the centreline at the bridge location and upstream/downstream intervals.
 4. Sample DEM elevations along transects.
-5. Produce cross-section plots and CSV/Excel outputs.
+5. Produce cross-section plots, per-transect CSV, and `summary.xlsx` with a SUMMARY sheet of transect hydraulics and a DATA sheet of every sampled point (ID, Transect ID, distance along the transect, elevation).
 6. Estimate channel slope from the river centreline on the DEM, then raise water level on each transect (trapezoidal area and hydraulic radius) until Manning’s equation matches the specified flow.
 
 ## Notes about LINZ
