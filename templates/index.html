@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HydroBridge — pick a bridge site</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <div>
+        <h1>HydroBridge</h1>
+        <p>Hydraulic screening at a bridge site</p>
+      </div>
+    </div>
+    <form id="search-form" class="search" autocomplete="off">
+      <label class="sr-only" for="search-q">Search for a place or bridge</label>
+      <input id="search-q" name="q" type="search" placeholder="Search a place, river, or address…" enterkeyhint="search">
+      <button type="submit">Find</button>
+      <ul id="search-results" class="search-results" hidden></ul>
+    </form>
+  </header>
+
+  <main class="layout">
+    <aside class="panel">
+      <section>
+        <h2>Bridge location</h2>
+        <p class="hint">Click the map, search, or type coordinates. The pin is the site that will be screened.</p>
+        <p id="place-label" class="place">No site selected yet</p>
+        <div class="coords">
+          <label>Latitude
+            <input id="lat" name="lat" type="number" step="0.000001" min="-90" max="90" value="-41.2865">
+          </label>
+          <label>Longitude
+            <input id="lon" name="lon" type="number" step="0.000001" min="-180" max="180" value="174.7762">
+          </label>
+        </div>
+        <div class="row-actions">
+          <button type="button" id="apply-coords" class="secondary">Move pin to coordinates</button>
+          <button type="button" id="wellington" class="ghost">Wellington sample site</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>River centreline</h2>
+        <p class="hint">Switch to Draw river, then click or drag along the channel. Transects follow this line instead of OpenStreetMap.</p>
+        <p id="line-label" class="place">No river line drawn yet — OSM will be used if available</p>
+        <div class="row-actions">
+          <button type="button" id="mode-pin" class="secondary" aria-pressed="true">Place bridge</button>
+          <button type="button" id="mode-draw" class="secondary" aria-pressed="false">Draw river</button>
+        </div>
+        <div class="row-actions">
+          <button type="button" id="undo-vertex" class="ghost" disabled>Undo last point</button>
+          <button type="button" id="clear-line" class="ghost" disabled>Clear line</button>
+          <button type="button" id="snap-pin" class="ghost" disabled>Snap pin to river</button>
+        </div>
+      </section>
+
+      <form id="run-form">
+        <section>
+          <h2>Elevation data</h2>
+          <p class="hint">HydroBridge clips the <a href="https://data.linz.govt.nz/layer/121859-new-zealand-lidar-1m-dem/" target="_blank" rel="noopener">New Zealand LiDAR 1m DEM</a> around the bridge pin. That nationwide layer is the default for every site.</p>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="linz" checked>
+            New Zealand LiDAR 1m DEM (LINZ)
+          </label>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="sample">
+            Use bundled Wellington sample DEM (offline)
+          </label>
+          <label class="choice">
+            <input type="radio" name="dem_source" value="upload">
+            Upload a GeoTIFF DEM
+          </label>
+          <label id="dem-file-wrap" class="file" hidden>
+            DEM file
+            <input id="dem-file" name="dem" type="file" accept=".tif,.tiff,image/tiff">
+          </label>
+        </section>
+
+        <section>
+          <h2>Transects and sampling</h2>
+          <p class="hint">Set the cross-section length, how far and how often they sit along the river, then the DEM sample spacing on each line.</p>
+          <label>Transect length (m)
+            <input name="length" type="number" step="1" min="10" value="200">
+          </label>
+          <p class="field-help">Width of each cross-section, centred on the river.</p>
+          <label>Length along river (m)
+            <input name="along" type="number" step="1" min="0" value="300">
+          </label>
+          <p class="field-help">Total reach along the centreline, centred on the bridge pin.</p>
+          <label>Transect spacing (m)
+            <input name="interval" type="number" step="1" min="1" value="50">
+          </label>
+          <p class="field-help">Distance between cross-sections along the centreline.</p>
+          <label>Sample spacing (m)
+            <input name="sample_spacing" type="number" step="0.1" min="0.1" value="1">
+          </label>
+          <p class="field-help">Distance between DEM sample points on each transect.</p>
+          <p id="layout-preview" class="place">7 transects · 201 DEM points each</p>
+        </section>
+
+        <section>
+          <h2>Flow</h2>
+          <p class="hint">Enter the design flow and Manning’s n. Slope is taken from the river centreline on the DEM. Water level is raised on each transect until Manning’s equation matches that flow.</p>
+          <label>Flow rate Q (m³/s)
+            <input name="flow" type="number" step="0.1" min="0" value="10">
+          </label>
+          <label>Manning’s n
+            <input name="mannings_n" type="number" step="0.001" min="0.001" value="0.035">
+          </label>
+        </section>
+
+        <button type="submit" id="run-btn" class="primary">Run screening at this site</button>
+        <p id="status" class="status" role="status"></p>
+      </form>
+    </aside>
+
+    <section class="map-wrap">
+      <p id="map-hint" class="map-hint">Click the map to place the bridge pin.</p>
+      <div id="map" role="application" aria-label="Map for choosing a bridge location and drawing the river"></div>
+    </section>
+  </main>
+
+  <section id="results" class="results" hidden>
+    <div class="results-head">
+      <h2>Screening results</h2>
+      <a id="summary-link" href="#" hidden>Download summary.xlsx</a>
+    </div>
+    <p id="results-note" class="hint"></p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Transect</th>
+            <th>Offset (m)</th>
+            <th>Samples</th>
+            <th>Water level (m)</th>
+            <th>Max depth (m)</th>
+            <th>Width (m)</th>
+            <th>Area (m²)</th>
+            <th>Hyd. radius (m)</th>
+            <th>Velocity (m/s)</th>
+            <th>Q (m³/s)</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+    <div id="plots" class="plots"></div>
+  </section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
