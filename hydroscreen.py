@@ -630,6 +630,20 @@ def plot_cross_section(dists, elevs, out_png, water_level=None):
     plt.close()
 
 
+DATA_SHEET_COLUMNS = ["ID", "Transect ID", "Distance_m", "Elevation_m"]
+
+
+def write_screening_workbook(path, summary_rows, data_rows):
+    """Write summary.xlsx with a SUMMARY sheet and a DATA sheet of sample points."""
+    path = Path(path)
+    summary_df = pd.DataFrame(summary_rows)
+    data_df = pd.DataFrame(data_rows, columns=DATA_SHEET_COLUMNS)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="SUMMARY", index=False)
+        data_df.to_excel(writer, sheet_name="DATA", index=False)
+    return path
+
+
 def centerline_from_coords(coords):
     """Build a river centreline from [[lon, lat], ...] vertices."""
     if not coords or len(coords) < 2:
@@ -771,7 +785,9 @@ def run_screening(
     logging.info("Estimated centreline slope S=%.6f", slope)
 
     summary = []
+    data_rows = []
     transect_features = []
+    point_id = 1
     for i, (tran, offset) in enumerate(transects):
         dists, elevs, sample_coords = sample_dem_along_line(
             dem_path, tran, spacing_m=sample_spacing
@@ -798,6 +814,14 @@ def run_screening(
             "plot": str(png_path),
         })
         summary.append(stats)
+        for dist, elev in zip(dists, elevs):
+            data_rows.append({
+                "ID": point_id,
+                "Transect ID": i + 1,
+                "Distance_m": float(dist),
+                "Elevation_m": float(elev) if np.isfinite(elev) else np.nan,
+            })
+            point_id += 1
         sample_preview = sample_coords
         if len(sample_preview) > 80:
             step = max(1, len(sample_preview) // 80)
@@ -814,10 +838,9 @@ def run_screening(
             "plot": png_path.name,
         })
 
-    summary_df = pd.DataFrame(summary)
     summary_path = outdir / "summary.xlsx"
-    summary_df.to_excel(summary_path, index=False)
-    logging.info("Wrote summary to %s", summary_path)
+    write_screening_workbook(summary_path, summary, data_rows)
+    logging.info("Wrote summary workbook to %s (%d sample points)", summary_path, len(data_rows))
 
     if temp_dir:
         logging.info("Temporary DEM stored in %s", temp_dir)
