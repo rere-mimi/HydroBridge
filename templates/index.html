@@ -110,15 +110,16 @@
           <p id="layout-preview" class="place">7 transects · 201 DEM points each</p>
         </section>
 
-        <details class="advanced">
-          <summary>Hydraulic options</summary>
+        <section>
+          <h2>Flow</h2>
+          <p class="hint">Enter the design flow and Manning’s n. Slope is taken from the river centreline on the DEM. Water level is raised on each transect until Manning’s equation matches that flow.</p>
+          <label>Flow rate Q (m³/s)
+            <input name="flow" type="number" step="0.1" min="0" value="10">
+          </label>
           <label>Manning’s n
             <input name="mannings_n" type="number" step="0.001" min="0.001" value="0.035">
           </label>
-          <label>Channel slope
-            <input name="slope" type="number" step="0.0001" min="0" value="0.001">
-          </label>
-        </details>
+        </section>
 
         <button type="submit" id="run-btn" class="primary">Run screening at this site</button>
         <p id="status" class="status" role="status"></p>
@@ -144,11 +145,14 @@
             <th>Transect</th>
             <th>Offset (m)</th>
             <th>Samples</th>
+            <th>Water level (m)</th>
+            <th>Max depth (m)</th>
             <th>Width (m)</th>
             <th>Area (m²)</th>
-            <th>Mean depth (m)</th>
+            <th>Hyd. radius (m)</th>
             <th>Velocity (m/s)</th>
-            <th>Discharge (m³/s)</th>
+            <th>Q (m³/s)</th>
+            <th>Status</th>
           </tr>
         </thead>
         <tbody id="results-body"></tbody>

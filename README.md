@@ -34,6 +34,7 @@ Then open http://127.0.0.1:5050. Place the bridge pin, then click **Draw river**
 - **Transect length** — width of each cross-section, centred on the river
 - **Length along river** and **Transect spacing** — how far along the centreline to cover and how often to cut a cross-section
 - **Sample spacing** — distance between DEM sample points on each transect
+- **Flow rate Q** and **Manning’s n** — water level is raised on each transect until Manning’s equation matches that flow; slope is estimated from the centreline
 
 HydroBridge then samples those points automatically. The bundled sample DEM covers Wellington Harbour; upload a GeoTIFF or use LINZ/WCS for other sites.
 
@@ -44,7 +45,7 @@ If LINZ public WCS is available for your dataset, supply the WCS base URL and la
 Local DEM:
 
 ```bash
-.venv/bin/python hydroscreen.py --lat -41.2865 --lon 174.7762 --dem tests/fixtures/sample_dem.tif --outdir outputs
+.venv/bin/python hydroscreen.py --lat -41.2865 --lon 174.7762 --dem tests/fixtures/sample_dem.tif --flow 10 --mannings_n 0.035 --outdir outputs
 ```
 
 Attempt LINZ WCS:
@@ -59,7 +60,7 @@ Attempt LINZ WCS:
 2. Generate transects perpendicular to the centreline at the bridge location and upstream/downstream intervals.
 3. Sample DEM elevations along transects.
 4. Produce cross-section plots and CSV/Excel outputs.
-5. Perform basic hydraulic checks: channel width, bank height, cross-sectional area, and a rough Manning velocity/capacity estimate (user-supplied slope and Manning's n).
+5. Estimate channel slope from the river centreline on the DEM, then raise water level on each transect (trapezoidal area and hydraulic radius) until Manning’s equation matches the specified flow.
 
 ## Notes about LINZ
 

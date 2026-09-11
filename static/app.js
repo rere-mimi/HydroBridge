@@ -219,27 +219,34 @@ function renderResults(payload) {
   }
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects along ${payload.layout.along_m ?? "—"} m of river, sampled every ${payload.layout.sample_spacing_m} m.`;
-    resultsNote.textContent = `${resultsNote.textContent} ${extra}`;
+    const flow = payload.layout.flow_m3_s != null ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${Number(payload.layout.slope).toExponential(2)}.` : "";
+    resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}`;
   }
+  summaryLink.hidden = !payload.summary_xlsx;
   summaryLink.href = payload.summary_xlsx || "#";
 
   (payload.summary || []).forEach((row) => {
+    const status = row.overtopped ? "Overtops banks" : (row.conveys ? "OK" : "Cannot convey");
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${row.transect}</td>
       <td>${fmt(row.offset_m, 1)}</td>
       <td>${row.n_samples ?? "—"}</td>
+      <td>${fmt(row.water_level_m, 2)}</td>
+      <td>${fmt(row.max_depth_m, 2)}</td>
       <td>${fmt(row.width_m, 1)}</td>
       <td>${fmt(row.area_m2, 1)}</td>
-      <td>${fmt(row.depth_mean_m, 2)}</td>
+      <td>${fmt(row.hydraulic_radius_m, 2)}</td>
       <td>${fmt(row.velocity_m_s, 2)}</td>
-      <td>${fmt(row.discharge_m3_s, 1)}</td>`;
+      <td>${fmt(row.discharge_m3_s, 2)}</td>
+      <td>${status}</td>`;
     resultsBody.appendChild(tr);
 
     const fig = document.createElement("figure");
     fig.innerHTML = `
       <img src="${row.plot}" alt="Cross-section for transect ${row.transect}">
       <figcaption>Transect ${row.transect} · offset ${fmt(row.offset_m, 0)} m
+        · water level ${fmt(row.water_level_m, 2)} m
         · <a href="${row.csv}">CSV</a></figcaption>`;
     plotsEl.appendChild(fig);
   });

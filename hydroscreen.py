@@ -6,6 +6,9 @@ Hydraulic screening MVP
 - Queries OSM (Overpass) for nearby waterway centreline
 - Generates transects and samples DEM elevations
 - Exports CSV/Excel and plots
+- Estimates bed slope from the river centreline, then raises water level on
+  each transect (trapezoidal area / hydraulic radius) until Manning Q matches
+  the specified flow
 
 Usage examples are in README.md
 """
@@ -368,63 +371,159 @@ def haversine(lon1, lat1, lon2, lat2):
 
 # Basic hydraulic checks
 
-def basic_hydraulic_checks(dists, elevs, mannings_n=0.035, slope=0.001):
-    """Compute width (approx where elevation below bank), area (trapezoid), and simple Manning velocity & capacity.
-    This is a heuristic: find channel by taking min elevation and banks where elevation rises by a threshold.
-    """
-    # Simple channel detection: find min elevation and define channel as points within (min + delta)
-    valid = ~np.isnan(elevs)
-    if valid.sum() == 0:
-        return {}
-    min_elev = np.nanmin(elevs)
-    delta = 0.5  # m above minimum to detect banks (heuristic)
-    channel_idx = np.where((elevs <= min_elev + delta) & valid)[0]
-    if len(channel_idx) == 0:
-        # fallback: take whole transect width
-        width = dists[-1] - dists[0]
-        area = 0.0
-    else:
-        width = dists[channel_idx[-1]] - dists[channel_idx[0]]
-        # approximate area by integrating depth from a heuristic bank elevation down to the bed
-        bank_elev = min_elev + delta
-        depths = np.maximum(0.0, (bank_elev - elevs[channel_idx[0]:channel_idx[-1]+1]))
-        # use trapezoidal approx across channel points
-        dx = np.diff(dists[channel_idx[0]:channel_idx[-1]+1])
-        if len(dx) == 0:
-            area = 0.0
+def hydraulics_at_stage(dists, elevs, water_level):
+    """Trapezoidal area and wetted perimeter at a water-surface elevation."""
+    if len(dists) < 2:
+        return {"area_m2": 0.0, "wetted_perimeter_m": 0.0, "top_width_m": 0.0, "hydraulic_radius_m": 0.0}
+    area = 0.0
+    perimeter = 0.0
+    top_width = 0.0
+    for i in range(len(dists) - 1):
+        x1, x2 = float(dists[i]), float(dists[i + 1])
+        z1, z2 = float(elevs[i]), float(elevs[i + 1])
+        if not (np.isfinite(x1) and np.isfinite(x2) and np.isfinite(z1) and np.isfinite(z2)):
+            continue
+        dx = x2 - x1
+        if dx <= 0:
+            continue
+        d1 = water_level - z1
+        d2 = water_level - z2
+        if d1 <= 0 and d2 <= 0:
+            continue
+        if d1 > 0 and d2 > 0:
+            area += 0.5 * (d1 + d2) * dx
+            perimeter += math.hypot(dx, z2 - z1)
+            top_width += dx
+            continue
+        # Waterline intersects this segment.
+        if z2 == z1:
+            continue
+        t = (water_level - z1) / (z2 - z1)
+        t = min(max(t, 0.0), 1.0)
+        xi = x1 + t * dx
+        if d1 > 0:
+            area += 0.5 * d1 * (xi - x1)
+            perimeter += math.hypot(xi - x1, water_level - z1)
+            top_width += xi - x1
         else:
-            trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-            area = trapz(depths, dists[channel_idx[0]:channel_idx[-1]+1])
-    # wetted perimeter approx: assume rectangular channel: P = width + 2 * depth_mean
-    depth_mean = area / width if width > 0 else 0.0
-    P = width + 2 * depth_mean
-    R = (area / P) if P > 0 else 0.0
-    # Manning velocity and capacity
-    if R > 0 and slope > 0:
-        velocity = (1.0 / mannings_n) * (R ** (2.0 / 3.0)) * (slope ** 0.5)
-        discharge = velocity * area
-    else:
-        velocity = 0.0
-        discharge = 0.0
+            area += 0.5 * d2 * (x2 - xi)
+            perimeter += math.hypot(x2 - xi, water_level - z2)
+            top_width += x2 - xi
+    radius = (area / perimeter) if perimeter > 0 else 0.0
     return {
-        "width_m": float(width),
         "area_m2": float(area),
-        "depth_mean_m": float(depth_mean),
-        "mannings_n": float(mannings_n),
-        "slope": float(slope),
-        "hydraulic_radius_m": float(R),
-        "velocity_m_s": float(velocity),
-        "discharge_m3_s": float(discharge)
+        "wetted_perimeter_m": float(perimeter),
+        "top_width_m": float(top_width),
+        "hydraulic_radius_m": float(radius),
     }
 
-# Plot and export
 
-def plot_cross_section(dists, elevs, out_png):
+def manning_discharge(area, radius, mannings_n, slope):
+    if area <= 0 or radius <= 0 or mannings_n <= 0 or slope <= 0:
+        return 0.0, 0.0
+    velocity = (1.0 / mannings_n) * (radius ** (2.0 / 3.0)) * (slope ** 0.5)
+    return float(velocity), float(velocity * area)
+
+
+def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
+    """Raise water level along the transect until Manning Q matches the specified flow."""
+    finite = elevs[np.isfinite(elevs)]
+    empty = {
+        "water_level_m": None,
+        "max_depth_m": 0.0,
+        "width_m": 0.0,
+        "area_m2": 0.0,
+        "depth_mean_m": 0.0,
+        "wetted_perimeter_m": 0.0,
+        "hydraulic_radius_m": 0.0,
+        "velocity_m_s": 0.0,
+        "discharge_m3_s": 0.0,
+        "target_discharge_m3_s": float(flow_m3_s),
+        "mannings_n": float(mannings_n),
+        "slope": float(slope),
+        "conveys": False,
+        "overtopped": False,
+    }
+    if len(finite) == 0:
+        return empty
+    zmin = float(np.min(finite))
+    zmax = float(np.max(finite))
+    if flow_m3_s <= 0:
+        empty.update({"water_level_m": zmin, "conveys": True})
+        return empty
+
+    max_wse = zmax + 2.0
+    wse = zmin + step_m
+    hyd = hydraulics_at_stage(dists, elevs, wse)
+    velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
+    # Increase stage until conveyance meets the target flow.
+    while discharge < flow_m3_s and wse < max_wse:
+        wse += step_m
+        hyd = hydraulics_at_stage(dists, elevs, wse)
+        velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
+
+    # Refine between the last two steps.
+    lo = max(zmin, wse - step_m)
+    hi = wse
+    for _ in range(24):
+        mid = 0.5 * (lo + hi)
+        hyd = hydraulics_at_stage(dists, elevs, mid)
+        velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
+        if discharge < flow_m3_s:
+            lo = mid
+        else:
+            hi = mid
+    wse = hi
+    hyd = hydraulics_at_stage(dists, elevs, wse)
+    velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
+    width = hyd["top_width_m"]
+    area = hyd["area_m2"]
+    overtopped = wse >= (zmax - 1e-6)
+    conveys = discharge + 1e-6 >= flow_m3_s
+    return {
+        "water_level_m": float(wse),
+        "max_depth_m": float(max(0.0, wse - zmin)),
+        "width_m": float(width),
+        "area_m2": float(area),
+        "depth_mean_m": float(area / width) if width > 0 else 0.0,
+        "wetted_perimeter_m": hyd["wetted_perimeter_m"],
+        "hydraulic_radius_m": hyd["hydraulic_radius_m"],
+        "velocity_m_s": float(velocity),
+        "discharge_m3_s": float(discharge),
+        "target_discharge_m3_s": float(flow_m3_s),
+        "mannings_n": float(mannings_n),
+        "slope": float(slope),
+        "conveys": bool(conveys),
+        "overtopped": bool(overtopped),
+    }
+
+
+def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0):
+    """Bed slope along the river centreline from DEM samples, as |dz/ds|."""
+    dists, elevs, _ = sample_dem_along_line(dem_path, centerline, spacing_m=spacing_m)
+    mask = np.isfinite(elevs)
+    if mask.sum() < 2:
+        return None
+    distance = dists[mask]
+    elevation = elevs[mask]
+    if float(distance[-1] - distance[0]) < 1.0:
+        return None
+    slope, _intercept = np.polyfit(distance.astype(float), elevation.astype(float), 1)
+    return abs(float(slope))
+
+
+def plot_cross_section(dists, elevs, out_png, water_level=None):
     plt.figure(figsize=(8, 4))
-    plt.plot(dists, elevs, '-k')
+    plt.plot(dists, elevs, '-k', label='Ground')
     finite = elevs[np.isfinite(elevs)]
     y_floor = (np.min(finite) - 1) if len(finite) else -1
-    plt.fill_between(dists, elevs, y_floor, color='lightblue')
+    if water_level is not None and np.isfinite(water_level):
+        wet = np.isfinite(elevs) & (elevs < water_level)
+        plt.fill_between(dists, elevs, water_level, where=wet, color='#4ea3c9', alpha=0.55, interpolate=True)
+        plt.axhline(water_level, color='#1f6f8b', linestyle='--', linewidth=1.2, label='Water level')
+        plt.legend(loc='best', frameon=False)
+    else:
+        plt.fill_between(dists, elevs, y_floor, color='lightblue')
     plt.xlabel('Distance (m)')
     plt.ylabel('Elevation (m)')
     plt.title('Cross-section')
@@ -472,7 +571,7 @@ def run_screening(
     n_each_side=3,
     length=200.0,
     mannings_n=0.035,
-    slope=0.001,
+    flow_m3_s=10.0,
     along_m=None,
     sample_spacing=1.0,
     centerline_coords=None,
@@ -533,6 +632,20 @@ def run_screening(
     if along_m is None:
         along_m = 2.0 * n_each_side * interval
 
+    if mannings_n <= 0:
+        raise HydroScreenError("Manning's n must be greater than 0.")
+    if flow_m3_s < 0:
+        raise HydroScreenError("Flow rate cannot be negative.")
+
+    slope = estimate_centerline_slope(dem_path, centerline, spacing_m=max(sample_spacing, 5.0))
+    if slope is None or slope <= 0:
+        raise HydroScreenError(
+            "Could not estimate river slope from the centreline DEM samples. Draw a longer river line over varying ground."
+        )
+    if slope < 1e-6:
+        slope = 1e-6
+    logging.info("Estimated centreline slope S=%.6f", slope)
+
     transects = generate_transects(
         centerline,
         interval=interval,
@@ -550,7 +663,9 @@ def run_screening(
         dists, elevs, sample_coords = sample_dem_along_line(
             dem_path, tran, spacing_m=sample_spacing
         )
-        stats = basic_hydraulic_checks(dists, elevs, mannings_n=mannings_n, slope=slope)
+        stats = solve_water_level(
+            dists, elevs, flow_m3_s=flow_m3_s, mannings_n=mannings_n, slope=slope
+        )
         df = pd.DataFrame({
             "distance_m": dists,
             "longitude": [xy[0] for xy in sample_coords],
@@ -560,7 +675,7 @@ def run_screening(
         csv_path = outdir / f"transect_{i+1}.csv"
         df.to_csv(csv_path, index=False)
         png_path = outdir / f"transect_{i+1}.png"
-        plot_cross_section(dists, elevs, png_path)
+        plot_cross_section(dists, elevs, png_path, water_level=stats.get("water_level_m"))
         stats.update({
             "transect": i + 1,
             "offset_m": float(offset),
@@ -611,6 +726,9 @@ def run_screening(
             "transect_length_m": float(length),
             "sample_spacing_m": float(sample_spacing),
             "n_transects": len(transects),
+            "flow_m3_s": float(flow_m3_s),
+            "mannings_n": float(mannings_n),
+            "slope": float(slope),
         },
         "temp_dem": temp_dir,
     }
@@ -630,8 +748,8 @@ def main():
     parser.add_argument('--n_each_side', type=int, default=None, help='Deprecated: number of transects each side of the bridge')
     parser.add_argument('--length', type=float, default=200.0, help='Length of each transect across the river (m)')
     parser.add_argument('--sample_spacing', type=float, default=1.0, help='Spacing of DEM sample points along each transect (m)')
-    parser.add_argument('--mannings_n', type=float, default=0.035, help="Manning's n for velocity estimate")
-    parser.add_argument('--slope', type=float, default=0.001, help='Channel slope for Manning estimate')
+    parser.add_argument('--flow', type=float, default=10.0, help='Design flow rate Q (m^3/s)')
+    parser.add_argument('--mannings_n', type=float, default=0.035, help="Manning's n")
     args = parser.parse_args()
     along_m = args.along
     if args.n_each_side is not None:
@@ -651,7 +769,7 @@ def main():
             along_m=along_m,
             sample_spacing=args.sample_spacing,
             mannings_n=args.mannings_n,
-            slope=args.slope,
+            flow_m3_s=args.flow,
         )
     except HydroScreenError as exc:
         logging.error("%s", exc)

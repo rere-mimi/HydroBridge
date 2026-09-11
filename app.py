@@ -123,11 +123,13 @@ def run():
         length = float(request.form.get("length") or 200)
         sample_spacing = float(request.form.get("sample_spacing") or 1)
         mannings_n = float(request.form.get("mannings_n") or 0.035)
-        slope = float(request.form.get("slope") or 0.001)
+        flow_m3_s = float(request.form.get("flow") or 10)
     except (TypeError, ValueError):
         return jsonify({"error": "Screening options must be numbers."}), 400
     if interval <= 0 or along_m < 0 or length <= 0 or sample_spacing <= 0:
         return jsonify({"error": "Transect length, spacing, and sample spacing must be greater than 0."}), 400
+    if mannings_n <= 0 or flow_m3_s < 0:
+        return jsonify({"error": "Flow rate must be ≥ 0 and Manning's n must be greater than 0."}), 400
 
     wcs_base = (request.form.get("wcs_base") or "").strip() or None
     wcs_layer = (request.form.get("wcs_layer") or "").strip() or None
@@ -158,7 +160,7 @@ def run():
             length=length,
             sample_spacing=sample_spacing,
             mannings_n=mannings_n,
-            slope=slope,
+            flow_m3_s=flow_m3_s,
             centerline_coords=centerline_coords,
         )
     except HydroScreenError as exc:
@@ -175,8 +177,15 @@ def run():
             "width_m": row.get("width_m"),
             "area_m2": row.get("area_m2"),
             "depth_mean_m": row.get("depth_mean_m"),
+            "max_depth_m": row.get("max_depth_m"),
+            "water_level_m": row.get("water_level_m"),
+            "hydraulic_radius_m": row.get("hydraulic_radius_m"),
             "velocity_m_s": row.get("velocity_m_s"),
             "discharge_m3_s": row.get("discharge_m3_s"),
+            "target_discharge_m3_s": row.get("target_discharge_m3_s"),
+            "slope": row.get("slope"),
+            "conveys": row.get("conveys"),
+            "overtopped": row.get("overtopped"),
             "n_samples": row.get("n_samples"),
             "plot": f"/results/{run_id}/{Path(row['plot']).name}",
             "csv": f"/results/{run_id}/{Path(row['csv']).name}",
