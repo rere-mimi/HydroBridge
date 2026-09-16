@@ -2,6 +2,7 @@
 
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import rasterio
 from rasterio.transform import from_origin
 
 from app import app
-from hydroscreen import HydroScreenCancelled, run_screening, solve_water_level
+from hydroscreen import HydroScreenCancelled, _run_interruptibly, run_screening, solve_water_level
 
 
 class CancelScreeningTests(unittest.TestCase):
@@ -26,6 +27,25 @@ class CancelScreeningTests(unittest.TestCase):
                     outdir=str(Path(tmp) / "out"),
                     cancel_event=cancelled,
                 )
+
+    def test_interruptible_call_stops_during_wait(self):
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def slow():
+            started.set()
+            time.sleep(8)
+            return "done"
+
+        def stopper():
+            started.wait(timeout=2)
+            cancelled.set()
+
+        threading.Thread(target=stopper, daemon=True).start()
+        t0 = time.time()
+        with self.assertRaises(HydroScreenCancelled):
+            _run_interruptibly(slow, cancelled)
+        self.assertLess(time.time() - t0, 2.0)
 
     def test_solve_water_level_stops_when_cancelled(self):
         cancelled = threading.Event()

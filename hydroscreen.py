@@ -22,6 +22,7 @@ import math
 import tempfile
 import shutil
 import logging
+import threading
 from pathlib import Path
 
 import requests
@@ -74,6 +75,29 @@ def check_cancelled(cancel_event):
     """Raise HydroScreenCancelled if the caller asked to stop."""
     if cancel_event is not None and cancel_event.is_set():
         raise HydroScreenCancelled("Screening stopped.")
+
+
+def _run_interruptibly(fn, cancel_event):
+    """Run a blocking call so Stop can return before a download finishes."""
+    if cancel_event is None:
+        return fn()
+    check_cancelled(cancel_event)
+    box = {}
+
+    def worker():
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    while worker_thread.is_alive():
+        check_cancelled(cancel_event)
+        worker_thread.join(0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 # Utilities
 
@@ -815,7 +839,10 @@ def run_screening(
         centerline_source = "drawn"
     else:
         logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
-        centerline = query_osm_waterway(lat, lon, radius_m=500)
+        centerline = _run_interruptibly(
+            lambda: query_osm_waterway(lat, lon, radius_m=500),
+            cancel_event,
+        )
         if centerline is None:
             logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
             centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
@@ -853,7 +880,10 @@ def run_screening(
         out_tif = os.path.join(temp_dir, "dem.tif")
         if wcs_base and wcs_layer:
             logging.info("Attempting user-supplied WCS for bbox (buffer %sm)", buffer_m)
-            ok = download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif)
+            ok = _run_interruptibly(
+                lambda: download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif),
+                cancel_event,
+            )
             if ok and _raster_covers_bbox(out_tif, bbox):
                 dem_path = out_tif
                 dem_source_used = "wcs"
@@ -868,7 +898,10 @@ def run_screening(
             )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
             try:
-                dem_path = download_linz_lidar_1m(bbox, linz_out)
+                dem_path = _run_interruptibly(
+                    lambda: download_linz_lidar_1m(bbox, linz_out),
+                    cancel_event,
+                )
                 dem_source_used = "linz-lidar-1m"
             except HydroScreenError:
                 raise
