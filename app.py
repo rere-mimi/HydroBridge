@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import secrets
+import tempfile
 from base64 import b64encode
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,7 +117,7 @@ def dem_preview():
         suffix = Path(uploaded.filename).suffix.lower()
         if suffix not in {".tif", ".tiff"}:
             return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
-        tmp = Path("/tmp") / f"hydroscreen-preview-{secrets.token_hex(4)}{suffix}"
+        tmp = Path(tempfile.gettempdir()) / f"hydroscreen-preview-{secrets.token_hex(4)}{suffix}"
         uploaded.save(tmp)
         dem_path = str(tmp)
     elif dem_source != "linz":
