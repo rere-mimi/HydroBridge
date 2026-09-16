@@ -470,12 +470,14 @@ out geom;
 
 # Transect generation
 
-def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None, along_m=None):
+def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None, along_m=None, cover_full_line=False):
     """Generate transects perpendicular to the centreline.
 
     Stations are measured from the nearest point on the centreline to the
     bridge coordinates when provided; otherwise the line midpoint is used.
-    If along_m is set, stations run from -along_m/2 to +along_m/2 at `interval`.
+    If cover_full_line is set, stations run from the start to the end of the
+    drawn centreline at `interval`. Otherwise, if along_m is set, stations run
+    from -along_m/2 to +along_m/2 at `interval`.
     Returns list of (transect LineString, station_m).
     """
     if interval <= 0:
@@ -497,12 +499,25 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
     else:
         origin = total_len / 2.0
     if not distances_m:
-        if along_m is None:
-            along_m = 2.0 * n_each_side * interval
-        half = max(float(along_m), 0.0) / 2.0
-        n = int(math.floor(half / interval + 1e-9))
-        n = min(max(n, 0), 50)
-        distances_m = [i * interval for i in range(-n, n + 1)]
+        if cover_full_line:
+            n = int(math.floor(total_len / interval + 1e-9)) if interval > 0 else 0
+            n = min(max(n, 0), 100)
+            starts = [float(i * interval) for i in range(n + 1)]
+            if not starts:
+                starts = [0.0]
+            if total_len - starts[-1] > 0.5:
+                starts.append(float(total_len))
+            if all(abs(s - origin) > 0.25 for s in starts):
+                starts.append(float(min(max(origin, 0.0), total_len)))
+                starts.sort()
+            distances_m = [s - origin for s in starts]
+        else:
+            if along_m is None:
+                along_m = 2.0 * n_each_side * interval
+            half = max(float(along_m), 0.0) / 2.0
+            n = int(math.floor(half / interval + 1e-9))
+            n = min(max(n, 0), 50)
+            distances_m = [i * interval for i in range(-n, n + 1)]
     stations = [origin + d for d in distances_m]
 
     transects = []
@@ -851,6 +866,13 @@ def centerline_from_coords(coords):
     return line
 
 
+def projected_length_m(line: LineString) -> float:
+    """Length of a lon/lat line in metres (Web Mercator)."""
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    proj = LineString([transformer.transform(x, y) for x, y in line.coords])
+    return float(proj.length)
+
+
 def run_screening(
     lat,
     lon,
@@ -879,10 +901,13 @@ def run_screening(
     if flow_m3_s < 0:
         raise HydroScreenError("Flow rate cannot be negative.")
 
+    cover_full_line = False
     if centerline_coords:
         logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
         centerline = centerline_from_coords(centerline_coords)
         centerline_source = "drawn"
+        cover_full_line = True
+        along_m = projected_length_m(centerline)
     else:
         logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
         centerline = query_osm_waterway(lat, lon, radius_m=500)
@@ -901,6 +926,7 @@ def run_screening(
         bridge_lon=lon,
         bridge_lat=lat,
         along_m=along_m,
+        cover_full_line=cover_full_line,
     )
     if not transects:
         raise HydroScreenError("No transects could be generated along the river centreline.")
@@ -956,7 +982,10 @@ def run_screening(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
 
-    reach = centerline_reach(centerline, lon, lat, along_m)
+    if cover_full_line:
+        reach = centerline
+    else:
+        reach = centerline_reach(centerline, lon, lat, along_m)
     slope = estimate_centerline_slope(dem_path, reach, spacing_m=max(sample_spacing, 5.0))
     if slope is None:
         raise HydroScreenError(

@@ -238,7 +238,8 @@ def run():
 
     try:
         interval = float(request.form.get("interval") or 50)
-        along_m = float(request.form.get("along") or 300)
+        along_raw = request.form.get("along")
+        along_m = float(along_raw) if along_raw not in (None, "") else 300.0
         length = float(request.form.get("length") or 200)
         sample_spacing = float(request.form.get("sample_spacing") or 1)
         mannings_n = float(request.form.get("mannings_n") or 0.035)
@@ -246,7 +247,7 @@ def run():
     except (TypeError, ValueError):
         return jsonify({"error": "Screening options must be numbers."}), 400
     if interval <= 0 or along_m < 0 or length <= 0 or sample_spacing <= 0:
-        return jsonify({"error": "Transect length, spacing, and sample spacing must be greater than 0."}), 400
+        return jsonify({"error": "Transect length and spacing must be greater than 0."}), 400
     if mannings_n <= 0 or flow_m3_s < 0:
         return jsonify({"error": "Flow rate must be ≥ 0 and Manning's n must be greater than 0."}), 400
 
