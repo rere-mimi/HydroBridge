@@ -400,6 +400,35 @@ def bbox_from_transects(lon, lat, transects, pad_m=50.0):
     radius = max(maxx - px, px - minx, maxy - py, py - miny)
     return (min(lons), min(lats), max(lons), max(lats)), float(radius)
 
+
+def bbox_from_lonlat_points(points, pad_m=80.0):
+    """Geographic bbox covering lon/lat points, padded in metres."""
+    if not points:
+        raise HydroScreenError("Need coordinates to clip the DEM.")
+    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    xs = []
+    ys = []
+    for lon, lat in points:
+        x, y = transformer_to_3857.transform(float(lon), float(lat))
+        xs.append(x)
+        ys.append(y)
+    cx = 0.5 * (min(xs) + max(xs))
+    cy = 0.5 * (min(ys) + max(ys))
+    minx = max(min(xs) - pad_m, cx - MAX_DEM_RADIUS_M)
+    maxx = min(max(xs) + pad_m, cx + MAX_DEM_RADIUS_M)
+    miny = max(min(ys) - pad_m, cy - MAX_DEM_RADIUS_M)
+    maxy = min(max(ys) + pad_m, cy + MAX_DEM_RADIUS_M)
+    corners = [
+        transformer_to_4326.transform(minx, miny),
+        transformer_to_4326.transform(minx, maxy),
+        transformer_to_4326.transform(maxx, miny),
+        transformer_to_4326.transform(maxx, maxy),
+    ]
+    lons = [c[0] for c in corners]
+    lats = [c[1] for c in corners]
+    return (min(lons), min(lats), max(lons), max(lats))
+
 # OSM centreline via Overpass
 
 def query_osm_waterway(lat, lon, radius_m=200):
@@ -551,6 +580,61 @@ def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=N
             else:
                 elevations.append(float(v))
         return np.array(distances), np.array(elevations), coords
+
+
+MAX_XS_LENGTH_M = 2000.0
+
+
+def sample_drawn_cross_section(lon1, lat1, lon2, lat2, dem_path=None, spacing_m=1.0):
+    """Sample DEM elevations along a two-point line and return a JSON-ready profile."""
+    try:
+        lon1, lat1, lon2, lat2 = float(lon1), float(lat1), float(lon2), float(lat2)
+    except (TypeError, ValueError) as exc:
+        raise HydroScreenError("Cross-section points must be numbers.") from exc
+    if not (-180 <= lon1 <= 180 and -180 <= lon2 <= 180 and -90 <= lat1 <= 90 and -90 <= lat2 <= 90):
+        raise HydroScreenError("Cross-section coordinates are out of range.")
+    if spacing_m is None or float(spacing_m) <= 0:
+        raise HydroScreenError("Sample spacing on the transect must be greater than 0.")
+    spacing_m = float(spacing_m)
+    length = haversine(lon1, lat1, lon2, lat2)
+    if length < 1.0:
+        raise HydroScreenError("The cross-section line is too short. Click two points farther apart.")
+    if length > MAX_XS_LENGTH_M:
+        raise HydroScreenError(
+            f"The cross-section can be at most {int(MAX_XS_LENGTH_M)} m long. Draw a shorter line near the bridge."
+        )
+
+    line = LineString([(lon1, lat1), (lon2, lat2)])
+    temp_dir = None
+    source = "local"
+    try:
+        if dem_path is None:
+            bbox = bbox_from_lonlat_points([(lon1, lat1), (lon2, lat2)], pad_m=80.0)
+            temp_dir = tempfile.mkdtemp(prefix="hydroscreen_xs_")
+            dem_path = os.path.join(temp_dir, "dem.tif")
+            download_linz_lidar_1m(bbox, dem_path)
+            source = "linz-lidar-1m"
+        dists, elevs, _coords = sample_dem_along_line(dem_path, line, spacing_m=spacing_m)
+        finite = elevs[np.isfinite(elevs)]
+        if len(finite) == 0:
+            raise HydroScreenError(
+                "No DEM elevations along this line. Draw it over the LiDAR coverage around the bridge."
+            )
+        return {
+            "distance_m": [float(x) for x in dists],
+            "elevation_m": [None if not np.isfinite(z) else float(z) for z in elevs],
+            "length_m": float(dists[-1]) if len(dists) else float(length),
+            "n_samples": int(len(dists)),
+            "sample_spacing_m": spacing_m,
+            "zmin": float(np.min(finite)),
+            "zmax": float(np.max(finite)),
+            "source": source,
+            "start": [lon1, lat1],
+            "end": [lon2, lat2],
+        }
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 # simple haversine
 

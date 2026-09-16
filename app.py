@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
-from hydroscreen import HydroScreenError, preview_dem_overlay, run_screening
+from hydroscreen import HydroScreenError, preview_dem_overlay, run_screening, sample_drawn_cross_section
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DEM = ROOT / "tests" / "fixtures" / "sample_dem.tif"
@@ -144,6 +144,61 @@ def dem_preview():
         "radius_m": result["radius_m"],
         "opacity": 0.5,
     })
+
+
+@app.post("/api/cross-section")
+def cross_section():
+    try:
+        lon1 = float(request.form.get("lon1"))
+        lat1 = float(request.form.get("lat1"))
+        lon2 = float(request.form.get("lon2"))
+        lat2 = float(request.form.get("lat2"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Click two points on the map to draw a cross-section."}), 400
+    if not (
+        -90 <= lat1 <= 90 and -90 <= lat2 <= 90 and -180 <= lon1 <= 180 and -180 <= lon2 <= 180
+    ):
+        return jsonify({"error": "Cross-section coordinates are out of range."}), 400
+    try:
+        spacing = float(request.form.get("sample_spacing") or 1)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Sample spacing must be a number."}), 400
+    if spacing <= 0:
+        return jsonify({"error": "Sample spacing must be greater than 0."}), 400
+
+    dem_source = (request.form.get("dem_source") or "linz").strip()
+    dem_path = None
+    cleanup = None
+    if dem_source == "sample":
+        if not SAMPLE_DEM.exists():
+            return jsonify({"error": "Bundled sample DEM is missing."}), 500
+        dem_path = str(SAMPLE_DEM)
+    elif dem_source == "upload":
+        uploaded = request.files.get("dem")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Choose a GeoTIFF DEM to sample, or use the New Zealand LiDAR 1m DEM."}), 400
+        suffix = Path(uploaded.filename).suffix.lower()
+        if suffix not in {".tif", ".tiff"}:
+            return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
+        cleanup = Path(tempfile.gettempdir()) / f"hydroscreen-xs-{secrets.token_hex(4)}{suffix}"
+        uploaded.save(cleanup)
+        dem_path = str(cleanup)
+    elif dem_source != "linz":
+        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
+
+    try:
+        profile = sample_drawn_cross_section(
+            lon1, lat1, lon2, lat2, dem_path=dem_path, spacing_m=spacing
+        )
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Cross-section sampling failed")
+        return jsonify({"error": f"Could not sample the DEM: {exc}"}), 500
+    finally:
+        if cleanup is not None:
+            cleanup.unlink(missing_ok=True)
+    return jsonify(profile)
 
 
 @app.post("/api/run")

@@ -51,11 +51,21 @@
         <div class="row-actions">
           <button type="button" id="mode-pin" class="secondary" aria-pressed="true">Place bridge</button>
           <button type="button" id="mode-draw" class="secondary" aria-pressed="false">Draw river</button>
+          <button type="button" id="mode-xs" class="secondary" aria-pressed="false">Cross-section</button>
         </div>
         <div class="row-actions">
           <button type="button" id="undo-vertex" class="ghost" disabled>Undo last point</button>
           <button type="button" id="clear-line" class="ghost" disabled>Clear line</button>
           <button type="button" id="snap-pin" class="ghost" disabled>Snap pin to river</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>DEM cross-section</h2>
+        <p class="hint">Select Cross-section, then left-click two points on the DEM around the bridge. Drawing a new line replaces the previous one and regenerates the profile under the map.</p>
+        <p id="xs-label" class="place">No cross-section yet</p>
+        <div class="row-actions">
+          <button type="button" id="clear-xs" class="ghost" disabled>Clear cross-section</button>
         </div>
       </section>
 
@@ -119,10 +129,19 @@
       </form>
     </aside>
 
-    <section class="map-wrap">
-      <p id="map-hint" class="map-hint">Click the map to place the bridge pin.</p>
-      <div id="map" role="application" aria-label="Map for choosing a bridge location and drawing the river"></div>
-    </section>
+    <div class="stage">
+      <section class="map-wrap">
+        <p id="map-hint" class="map-hint">Click the map to place the bridge pin.</p>
+        <div id="map" role="application" aria-label="Map for choosing a bridge location, drawing the river, and cutting a DEM cross-section"></div>
+      </section>
+      <section id="xs-viewer" class="xs-viewer" hidden>
+        <div class="xs-head">
+          <h2>DEM cross-section</h2>
+          <p id="xs-meta" class="hint">Left-click two points on the map.</p>
+        </div>
+        <canvas id="xs-canvas" aria-label="DEM elevation along the drawn line"></canvas>
+      </section>
+    </div>
   </main>
 
   <section id="results" class="results" hidden>
@@ -155,6 +174,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=dem-overlay"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=xs-tool"></script>
 </body>
 </html>

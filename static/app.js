@@ -18,10 +18,16 @@ const summaryLink = document.getElementById("summary-link");
 const demFileWrap = document.getElementById("dem-file-wrap");
 const modePinBtn = document.getElementById("mode-pin");
 const modeDrawBtn = document.getElementById("mode-draw");
+const modeXsBtn = document.getElementById("mode-xs");
 const undoBtn = document.getElementById("undo-vertex");
 const clearBtn = document.getElementById("clear-line");
 const snapBtn = document.getElementById("snap-pin");
+const clearXsBtn = document.getElementById("clear-xs");
 const layoutPreview = document.getElementById("layout-preview");
+const xsLabel = document.getElementById("xs-label");
+const xsViewer = document.getElementById("xs-viewer");
+const xsMeta = document.getElementById("xs-meta");
+const xsCanvas = document.getElementById("xs-canvas");
 
 const map = L.map("map").setView([WELLINGTON.lat, WELLINGTON.lon], WELLINGTON.zoom);
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -35,6 +41,13 @@ map.getPane("demPane").style.pointerEvents = "none";
 const overlay = L.layerGroup().addTo(map);
 const draftLine = L.polyline([], { color: "#1f6f8b", weight: 5, opacity: 0.95 }).addTo(map);
 const vertexLayer = L.layerGroup().addTo(map);
+const xsLayer = L.layerGroup().addTo(map);
+const xsDraftLine = L.polyline([], {
+  color: "#c45c26",
+  weight: 3,
+  dashArray: "6 6",
+  opacity: 0.9,
+}).addTo(map);
 let marker = L.marker([WELLINGTON.lat, WELLINGTON.lon], { draggable: true }).addTo(map);
 marker.bindPopup("Bridge site").openPopup();
 
@@ -45,6 +58,9 @@ let demOverlay = null;
 let demOverlayUrl = null;
 let demPreviewTimer = null;
 let demPreviewSeq = 0;
+let xsPoints = [];
+let xsProfile = null;
+let xsRequestSeq = 0;
 
 function setStatus(message, kind) {
   statusEl.textContent = message || "";
@@ -122,8 +138,10 @@ async function refreshDemOverlay() {
       interactive: false,
       className: "dem-overlay",
     }).addTo(map);
-    if (mode !== "draw") {
-      mapHint.textContent = "DEM shown at 50% opacity. Click the map to move the pin.";
+    if (mode === "draw") {
+      mapHint.textContent = "Click or drag along the river. Double-click when the line is done.";
+    } else if (mode === "xs") {
+      mapHint.textContent = "Left-click two points on the DEM to draw a cross-section.";
     }
   } catch (_err) {
     if (seq !== demPreviewSeq) return;
@@ -194,19 +212,286 @@ function addVertex(latlng) {
   redrawDraft();
 }
 
+function xsVertexStyle() {
+  return {
+    radius: 6,
+    color: "#7a2e12",
+    fillColor: "#f4d2b0",
+    fillOpacity: 1,
+    weight: 2,
+  };
+}
+
+function refreshXsLabel() {
+  if (xsPoints.length === 0) {
+    xsLabel.textContent = "No cross-section yet";
+    clearXsBtn.disabled = true;
+    return;
+  }
+  clearXsBtn.disabled = false;
+  if (xsPoints.length === 1) {
+    xsLabel.textContent = "First point placed — left-click a second point";
+    return;
+  }
+  const metres = map.distance(xsPoints[0], xsPoints[1]);
+  const samples = xsProfile ? xsProfile.n_samples : null;
+  xsLabel.textContent = samples
+    ? `Cross-section · ${metres.toFixed(0)} m · ${samples} DEM samples`
+    : `Cross-section · ${metres.toFixed(0)} m`;
+}
+
+function drawXsLine() {
+  xsLayer.clearLayers();
+  xsDraftLine.setLatLngs(xsPoints.length === 1 ? xsPoints : []);
+  if (!xsPoints.length) return;
+  xsPoints.forEach((ll, index) => {
+    L.circleMarker(ll, xsVertexStyle())
+      .bindTooltip(index === 0 ? "A" : "B", { permanent: true, direction: "top", offset: [0, -8] })
+      .addTo(xsLayer);
+  });
+  if (xsPoints.length === 2) {
+    L.polyline(xsPoints, { color: "#c45c26", weight: 4, opacity: 0.95 }).addTo(xsLayer);
+  }
+}
+
+function clearXsChart() {
+  if (!xsCanvas) return;
+  const ctx = xsCanvas.getContext("2d");
+  const width = xsCanvas.clientWidth || 640;
+  const height = xsCanvas.clientHeight || 200;
+  xsCanvas.width = width;
+  xsCanvas.height = height;
+  ctx.clearRect(0, 0, width, height);
+}
+
+function drawXsProfile(profile) {
+  if (!xsCanvas || !profile) return;
+  const dists = profile.distance_m || [];
+  const elevs = profile.elevation_m || [];
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(xsCanvas.clientWidth || 640, 320);
+  const cssH = Math.max(xsCanvas.clientHeight || 200, 160);
+  xsCanvas.width = Math.round(cssW * dpr);
+  xsCanvas.height = Math.round(cssH * dpr);
+  const ctx = xsCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = "#f4f1ea";
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  const pad = { left: 52, right: 16, top: 14, bottom: 32 };
+  const plotW = cssW - pad.left - pad.right;
+  const plotH = cssH - pad.top - pad.bottom;
+  const xmax = dists.length ? Number(dists[dists.length - 1]) : 1;
+  const finite = elevs.filter((z) => z != null && Number.isFinite(Number(z))).map(Number);
+  if (!finite.length || plotW < 10 || plotH < 10) {
+    ctx.fillStyle = "#4d646e";
+    ctx.font = "13px Segoe UI, system-ui, sans-serif";
+    ctx.fillText("No elevations along this line.", pad.left, pad.top + 16);
+    return;
+  }
+  let zmin = Math.min(...finite);
+  let zmax = Math.max(...finite);
+  if (zmax <= zmin) zmax = zmin + 1;
+  const zPad = (zmax - zmin) * 0.08;
+  zmin -= zPad;
+  zmax += zPad;
+
+  const xOf = (d) => pad.left + (Number(d) / Math.max(xmax, 1e-6)) * plotW;
+  const yOf = (z) => pad.top + (1 - (Number(z) - zmin) / (zmax - zmin)) * plotH;
+
+  ctx.strokeStyle = "#d7d0c4";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top);
+  ctx.lineTo(pad.left, pad.top + plotH);
+  ctx.lineTo(pad.left + plotW, pad.top + plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = "#4d646e";
+  ctx.font = "11px Segoe UI, system-ui, sans-serif";
+  ctx.fillText("Distance (m)", pad.left + plotW / 2 - 32, cssH - 8);
+  ctx.save();
+  ctx.translate(14, pad.top + plotH / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("Elevation (m)", -40, 0);
+  ctx.restore();
+  ctx.fillText(zmin.toFixed(1), 6, yOf(zmin) + 3);
+  ctx.fillText(zmax.toFixed(1), 6, yOf(zmax) + 3);
+  ctx.fillText("0", xOf(0) - 3, pad.top + plotH + 16);
+  ctx.fillText(xmax.toFixed(0), xOf(xmax) - 12, pad.top + plotH + 16);
+
+  const points = [];
+  dists.forEach((dist, i) => {
+    const z = elevs[i];
+    if (z == null || !Number.isFinite(Number(z))) {
+      points.push(null);
+      return;
+    }
+    points.push([xOf(dist), yOf(z)]);
+  });
+
+  ctx.beginPath();
+  let drawing = false;
+  points.forEach((pt) => {
+    if (!pt) {
+      drawing = false;
+      return;
+    }
+    if (!drawing) {
+      ctx.moveTo(pt[0], pt[1]);
+      drawing = true;
+    } else {
+      ctx.lineTo(pt[0], pt[1]);
+    }
+  });
+  const first = points.find((pt) => pt);
+  const last = [...points].reverse().find((pt) => pt);
+  if (first && last) {
+    ctx.lineTo(last[0], pad.top + plotH);
+    ctx.lineTo(first[0], pad.top + plotH);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(31, 111, 139, 0.22)";
+    ctx.fill();
+  }
+
+  ctx.beginPath();
+  drawing = false;
+  points.forEach((pt) => {
+    if (!pt) {
+      drawing = false;
+      return;
+    }
+    if (!drawing) {
+      ctx.moveTo(pt[0], pt[1]);
+      drawing = true;
+    } else {
+      ctx.lineTo(pt[0], pt[1]);
+    }
+  });
+  ctx.strokeStyle = "#12232b";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function showXsViewer() {
+  xsViewer.hidden = false;
+  requestAnimationFrame(() => {
+    map.invalidateSize();
+    if (xsProfile) drawXsProfile(xsProfile);
+  });
+}
+
+function hideXsViewer() {
+  xsViewer.hidden = true;
+  requestAnimationFrame(() => map.invalidateSize());
+}
+
+function setXsMeta(text) {
+  xsMeta.textContent = text;
+}
+
+function resetXsDrawing({ keepViewer = false } = {}) {
+  xsPoints = [];
+  xsProfile = null;
+  xsDraftLine.setLatLngs([]);
+  xsLayer.clearLayers();
+  refreshXsLabel();
+  if (keepViewer) {
+    clearXsChart();
+    setXsMeta("Left-click two points on the map.");
+  } else {
+    hideXsViewer();
+  }
+}
+
+async function requestXsProfile(start, end) {
+  const seq = (xsRequestSeq += 1);
+  const body = new FormData(runForm);
+  body.set("lon1", String(start.lng));
+  body.set("lat1", String(start.lat));
+  body.set("lon2", String(end.lng));
+  body.set("lat2", String(end.lat));
+  body.set("dem_source", currentDemSource());
+  if (currentDemSource() === "upload") {
+    const file = document.getElementById("dem-file");
+    if (file && file.files && file.files[0]) body.set("dem", file.files[0]);
+  }
+  setXsMeta("Sampling the DEM…");
+  showXsViewer();
+  try {
+    const res = await fetch("/api/cross-section", { method: "POST", body });
+    const data = await res.json();
+    if (seq !== xsRequestSeq) return;
+    if (!res.ok) {
+      setStatus(data.error || "Could not sample the DEM.", "error");
+      setXsMeta(data.error || "Could not sample the DEM.");
+      clearXsChart();
+      return;
+    }
+    xsProfile = data;
+    setStatus("");
+    const source = data.source === "linz-lidar-1m" ? "New Zealand LiDAR 1m DEM" : "selected DEM";
+    setXsMeta(
+      `${fmt(data.length_m, 0)} m line · ${data.n_samples} samples every ${fmt(data.sample_spacing_m, 1)} m · ${source}`
+    );
+    refreshXsLabel();
+    drawXsProfile(data);
+  } catch (_err) {
+    if (seq !== xsRequestSeq) return;
+    setStatus("Could not reach the HydroBridge server.", "error");
+    setXsMeta("Could not sample the DEM.");
+  }
+}
+
+function handleXsClick(latlng) {
+  if (xsPoints.length >= 2) {
+    xsPoints = [];
+    xsDraftLine.setLatLngs([]);
+    xsLayer.clearLayers();
+    setXsMeta("Click the second point. The profile will regenerate.");
+  }
+  if (xsPoints.length === 1 && map.distance(xsPoints[0], latlng) < 5) {
+    return;
+  }
+  xsPoints.push(L.latLng(latlng.lat, latlng.lng));
+  drawXsLine();
+  refreshXsLabel();
+  if (xsPoints.length === 1) {
+    mapHint.textContent = "Click the second point on the DEM.";
+    showXsViewer();
+    if (!xsProfile) {
+      clearXsChart();
+      setXsMeta("Click the second point. The profile will appear here.");
+    }
+    return;
+  }
+  xsDraftLine.setLatLngs([]);
+  mapHint.textContent = "Cross-section ready. Click two new points to replace it.";
+  requestXsProfile(xsPoints[0], xsPoints[1]);
+}
+
 function setMode(next) {
   mode = next;
   document.body.classList.toggle("mode-draw", mode === "draw");
+  document.body.classList.toggle("mode-xs", mode === "xs");
   modePinBtn.setAttribute("aria-pressed", String(mode === "pin"));
   modeDrawBtn.setAttribute("aria-pressed", String(mode === "draw"));
+  modeXsBtn.setAttribute("aria-pressed", String(mode === "xs"));
+  drawingStroke = false;
   if (mode === "draw") {
     map.dragging.disable();
     map.doubleClickZoom.disable();
     mapHint.textContent = "Click or drag along the river. Double-click when the line is done.";
+  } else if (mode === "xs") {
+    map.dragging.enable();
+    map.doubleClickZoom.disable();
+    mapHint.textContent = xsPoints.length === 1
+      ? "Click the second point on the DEM."
+      : "Left-click two points on the DEM to draw a cross-section.";
   } else {
     map.dragging.enable();
     map.doubleClickZoom.enable();
-    drawingStroke = false;
     mapHint.textContent = "Click the map to place the bridge pin.";
   }
 }
@@ -339,6 +624,10 @@ map.on("click", (event) => {
     addVertex(event.latlng);
     return;
   }
+  if (mode === "xs") {
+    handleXsClick(event.latlng);
+    return;
+  }
   setLocation(event.latlng.lat, event.latlng.lng);
 });
 
@@ -355,6 +644,10 @@ map.on("mousedown", (event) => {
 });
 
 map.on("mousemove", (event) => {
+  if (mode === "xs" && xsPoints.length === 1) {
+    xsDraftLine.setLatLngs([xsPoints[0], event.latlng]);
+    return;
+  }
   if (mode !== "draw" || !drawingStroke) return;
   addVertex(event.latlng);
 });
@@ -374,6 +667,7 @@ marker.on("dragend", () => {
 
 modePinBtn.addEventListener("click", () => setMode("pin"));
 modeDrawBtn.addEventListener("click", () => setMode("draw"));
+modeXsBtn.addEventListener("click", () => setMode("xs"));
 
 undoBtn.addEventListener("click", () => {
   drawnLatLngs.pop();
@@ -383,6 +677,13 @@ undoBtn.addEventListener("click", () => {
 clearBtn.addEventListener("click", () => {
   drawnLatLngs = [];
   redrawDraft();
+});
+
+clearXsBtn.addEventListener("click", () => {
+  resetXsDrawing();
+  if (mode === "xs") {
+    mapHint.textContent = "Left-click two points on the DEM to draw a cross-section.";
+  }
 });
 
 snapBtn.addEventListener("click", () => {
@@ -494,6 +795,10 @@ runForm.addEventListener("submit", async (event) => {
   } finally {
     runBtn.disabled = false;
   }
+});
+
+window.addEventListener("resize", () => {
+  if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile);
 });
 
 refreshPlaceName(WELLINGTON.lat, WELLINGTON.lon);
