@@ -364,14 +364,21 @@ input[type="file"] {
 
 button { font: inherit; cursor: pointer; }
 
-.primary, .secondary, .ghost {
+.primary, .secondary, .ghost, .stop {
   border-radius: 0.6rem;
   padding: 0.48rem 0.7rem;
 }
 
+.run-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-top: 0.55rem;
+}
+
 .primary {
   width: 100%;
-  margin-top: 0.55rem;
+  margin-top: 0;
   border: 0;
   background: var(--accent);
   color: white;
@@ -382,6 +389,20 @@ button { font: inherit; cursor: pointer; }
 .primary:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.stop {
+  width: 100%;
+  border: 0;
+  background: var(--bad);
+  color: white;
+  font-weight: 650;
+  padding: 0.75rem 0.8rem;
+}
+
+.stop:disabled {
+  opacity: 0.7;
+  cursor: wait;
 }
 
 .secondary {

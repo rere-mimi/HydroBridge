@@ -7,6 +7,7 @@ import logging
 import re
 import secrets
 import tempfile
+import threading
 from base64 import b64encode
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,13 @@ from pathlib import Path
 import requests
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
-from hydroscreen import HydroScreenError, preview_dem_overlay, run_screening, sample_drawn_cross_section
+from hydroscreen import (
+    HydroScreenCancelled,
+    HydroScreenError,
+    preview_dem_overlay,
+    run_screening,
+    sample_drawn_cross_section,
+)
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DEM = ROOT / "tests" / "fixtures" / "sample_dem.tif"
@@ -26,11 +33,37 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 RUN_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{6}$")
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_active_jobs = {}
+_active_jobs_lock = threading.Lock()
 
 
 def _new_run_id():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{stamp}-{secrets.token_hex(3)}"
+
+
+def _parse_job_id():
+    job_id = (request.form.get("job_id") or "").strip()
+    if not job_id:
+        payload = request.get_json(silent=True) or {}
+        job_id = str(payload.get("job_id") or "").strip()
+    if JOB_ID_RE.match(job_id):
+        return job_id
+    return None
+
+
+@app.post("/api/stop")
+def stop_run():
+    job_id = _parse_job_id()
+    if not job_id:
+        return jsonify({"error": "Missing screening job."}), 400
+    with _active_jobs_lock:
+        event = _active_jobs.get(job_id)
+    if event is not None:
+        event.set()
+        logging.info("Stop requested for screening job %s", job_id)
+    return jsonify({"cancelled": True})
 
 
 @app.get("/")
@@ -267,6 +300,10 @@ def run():
             return jsonify({"error": "The drawn river line has too many points. Clear it and draw a simpler line."}), 400
         centerline_coords = parsed
 
+    job_id = _parse_job_id() or secrets.token_hex(8)
+    cancel_event = threading.Event()
+    with _active_jobs_lock:
+        _active_jobs[job_id] = cancel_event
     try:
         result = run_screening(
             lat=lat,
@@ -282,12 +319,19 @@ def run():
             mannings_n=mannings_n,
             flow_m3_s=flow_m3_s,
             centerline_coords=centerline_coords,
+            cancel_event=cancel_event,
         )
+    except HydroScreenCancelled:
+        return jsonify({"cancelled": True, "error": "Screening stopped."}), 409
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         logging.exception("Screening failed")
         return jsonify({"error": f"Screening failed: {exc}"}), 500
+    finally:
+        with _active_jobs_lock:
+            if _active_jobs.get(job_id) is cancel_event:
+                _active_jobs.pop(job_id, None)
 
     public_summary = []
     for row in result["summary"]:
@@ -343,4 +387,4 @@ def result_file(run_id, filename):
 
 if __name__ == "__main__":
     OUTPUTS.mkdir(parents=True, exist_ok=True)
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)

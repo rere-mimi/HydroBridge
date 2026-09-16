@@ -161,7 +161,10 @@
     <input id="lon" name="lon" type="hidden">
     <input id="along" name="along" type="hidden" value="300">
 
-    <button type="submit" id="run-btn" class="primary" disabled>Run screening</button>
+    <div class="run-actions">
+      <button type="submit" id="run-btn" class="primary" disabled>Run screening</button>
+      <button type="button" id="stop-btn" class="stop" hidden>Stop screening</button>
+    </div>
   </form>
 
   <div id="name-modal" class="modal" hidden>
