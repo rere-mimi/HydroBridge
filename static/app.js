@@ -10,6 +10,7 @@ const searchResults = document.getElementById("search-results");
 const statusEl = document.getElementById("status");
 const runForm = document.getElementById("run-form");
 const runBtn = document.getElementById("run-btn");
+const stopBtn = document.getElementById("stop-btn");
 const resultsEl = document.getElementById("results");
 const resultsBody = document.getElementById("results-body");
 const resultsNote = document.getElementById("results-note");
@@ -45,10 +46,18 @@ let demOverlay = null;
 let demOverlayUrl = null;
 let demPreviewTimer = null;
 let demPreviewSeq = 0;
+let runAbort = null;
+let runJobId = null;
 
 function setStatus(message, kind) {
   statusEl.textContent = message || "";
   statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+function setRunning(running) {
+  runBtn.disabled = running;
+  stopBtn.hidden = !running;
+  stopBtn.disabled = !running;
 }
 
 function fmt(value, digits) {
@@ -475,11 +484,23 @@ runForm.addEventListener("submit", async (event) => {
   body.set("lon", String(lon));
   const drawn = centerlinePayload();
   if (drawn) body.set("centerline", JSON.stringify(drawn));
-  runBtn.disabled = true;
-  setStatus("Running screening… this can take a few seconds.");
+  const jobId = (crypto.randomUUID && crypto.randomUUID()) || `job-${Date.now()}`;
+  body.set("job_id", jobId);
+  runJobId = jobId;
+  runAbort = new AbortController();
+  setRunning(true);
+  setStatus("Running screening… Click Stop to change parameters and run again.");
   try {
-    const res = await fetch("/api/run", { method: "POST", body });
-    const data = await res.json();
+    const res = await fetch("/api/run", {
+      method: "POST",
+      body,
+      signal: runAbort.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (data.cancelled || res.status === 409) {
+      setStatus("Screening stopped. Change parameters and run again.");
+      return;
+    }
     if (!res.ok) {
       setStatus(data.error || "Screening failed.", "error");
       return;
@@ -489,11 +510,37 @@ runForm.addEventListener("submit", async (event) => {
     drawRunGeometry(data);
     renderResults(data);
     marker.setLatLng([data.lat, data.lon]);
-  } catch (_err) {
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      setStatus("Screening stopped. Change parameters and run again.");
+      return;
+    }
     setStatus("Could not reach the HydroBridge server.", "error");
   } finally {
-    runBtn.disabled = false;
+    setRunning(false);
+    runAbort = null;
+    runJobId = null;
   }
+});
+
+stopBtn.addEventListener("click", async () => {
+  const jobId = runJobId;
+  const abort = runAbort;
+  if (!jobId && !abort) return;
+  stopBtn.disabled = true;
+  setStatus("Stopping screening…");
+  if (jobId) {
+    try {
+      await fetch("/api/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: jobId }),
+      });
+    } catch (_err) {
+      /* still abort the in-flight run request */
+    }
+  }
+  if (abort) abort.abort();
 });
 
 refreshPlaceName(WELLINGTON.lat, WELLINGTON.lon);

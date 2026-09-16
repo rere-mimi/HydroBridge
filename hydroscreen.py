@@ -22,6 +22,7 @@ import math
 import tempfile
 import shutil
 import logging
+import threading
 from pathlib import Path
 
 import requests
@@ -64,6 +65,39 @@ DEM_PREVIEW_MIN_RADIUS_M = 1500.0
 
 class HydroScreenError(Exception):
     """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
+
+
+class HydroScreenCancelled(HydroScreenError):
+    """Raised when the user stops a screening run."""
+
+
+def check_cancelled(cancel_event):
+    """Raise HydroScreenCancelled if the caller asked to stop."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise HydroScreenCancelled("Screening stopped.")
+
+
+def _run_interruptibly(fn, cancel_event):
+    """Run a blocking call so Stop can return before a download finishes."""
+    if cancel_event is None:
+        return fn()
+    check_cancelled(cancel_event)
+    box = {}
+
+    def worker():
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    while worker_thread.is_alive():
+        check_cancelled(cancel_event)
+        worker_thread.join(0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 # Utilities
 
@@ -619,7 +653,7 @@ def manning_discharge(area, radius, mannings_n, slope):
     return float(velocity), float(velocity * area)
 
 
-def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
+def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, cancel_event=None):
     """Raise water level along the transect until Manning Q matches the specified flow."""
     finite = elevs[np.isfinite(elevs)]
     empty = {
@@ -652,6 +686,7 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
     velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
     # Increase stage until conveyance meets the target flow.
     while discharge < flow_m3_s and wse < max_wse:
+        check_cancelled(cancel_event)
         wse += step_m
         hyd = hydraulics_at_stage(dists, elevs, wse)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
@@ -660,6 +695,7 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
     lo = max(zmin, wse - step_m)
     hi = wse
     for _ in range(24):
+        check_cancelled(cancel_event)
         mid = 0.5 * (lo + hi)
         hyd = hydraulics_at_stage(dists, elevs, mid)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
@@ -783,10 +819,12 @@ def run_screening(
     along_m=None,
     sample_spacing=1.0,
     centerline_coords=None,
+    cancel_event=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    check_cancelled(cancel_event)
 
     if along_m is None:
         along_m = 2.0 * n_each_side * interval
@@ -801,13 +839,17 @@ def run_screening(
         centerline_source = "drawn"
     else:
         logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
-        centerline = query_osm_waterway(lat, lon, radius_m=500)
+        centerline = _run_interruptibly(
+            lambda: query_osm_waterway(lat, lon, radius_m=500),
+            cancel_event,
+        )
         if centerline is None:
             logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
             centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
             centerline_source = "synthetic"
         else:
             centerline_source = "osm"
+    check_cancelled(cancel_event)
 
     transects = generate_transects(
         centerline,
@@ -821,6 +863,7 @@ def run_screening(
     if not transects:
         raise HydroScreenError("No transects could be generated along the river centreline.")
     logging.info("Generated %d transects", len(transects))
+    check_cancelled(cancel_event)
 
     dem_path = dem
     temp_dir = None
@@ -832,11 +875,15 @@ def run_screening(
         buffer_m = fallback_radius
 
     if dem_path is None:
+        check_cancelled(cancel_event)
         temp_dir = tempfile.mkdtemp(prefix="hydroscreen_")
         out_tif = os.path.join(temp_dir, "dem.tif")
         if wcs_base and wcs_layer:
             logging.info("Attempting user-supplied WCS for bbox (buffer %sm)", buffer_m)
-            ok = download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif)
+            ok = _run_interruptibly(
+                lambda: download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif),
+                cancel_event,
+            )
             if ok and _raster_covers_bbox(out_tif, bbox):
                 dem_path = out_tif
                 dem_source_used = "wcs"
@@ -851,7 +898,10 @@ def run_screening(
             )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
             try:
-                dem_path = download_linz_lidar_1m(bbox, linz_out)
+                dem_path = _run_interruptibly(
+                    lambda: download_linz_lidar_1m(bbox, linz_out),
+                    cancel_event,
+                )
                 dem_source_used = "linz-lidar-1m"
             except HydroScreenError:
                 raise
@@ -872,6 +922,7 @@ def run_screening(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
 
+    check_cancelled(cancel_event)
     reach = centerline_reach(centerline, lon, lat, along_m)
     slope = estimate_centerline_slope(dem_path, reach, spacing_m=max(sample_spacing, 5.0))
     if slope is None:
@@ -886,11 +937,17 @@ def run_screening(
     transect_features = []
     point_id = 1
     for i, (tran, offset) in enumerate(transects):
+        check_cancelled(cancel_event)
         dists, elevs, sample_coords = sample_dem_along_line(
             dem_path, tran, spacing_m=sample_spacing
         )
         stats = solve_water_level(
-            dists, elevs, flow_m3_s=flow_m3_s, mannings_n=mannings_n, slope=slope
+            dists,
+            elevs,
+            flow_m3_s=flow_m3_s,
+            mannings_n=mannings_n,
+            slope=slope,
+            cancel_event=cancel_event,
         )
         df = pd.DataFrame({
             "distance_m": dists,
@@ -935,6 +992,7 @@ def run_screening(
             "plot": png_path.name,
         })
 
+    check_cancelled(cancel_event)
     summary_path = outdir / "summary.xlsx"
     write_screening_workbook(summary_path, summary, data_rows)
     logging.info("Wrote summary workbook to %s (%d sample points)", summary_path, len(data_rows))
