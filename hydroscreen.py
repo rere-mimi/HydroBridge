@@ -69,6 +69,8 @@ DEM_PREVIEW_MAX_PX = 640
 DEM_PREVIEW_MIN_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_CACHE_MAX_FILES = 12
 _CACHE_LOCK = threading.Lock()
+_TILE_LOCKS_GUARD = threading.Lock()
+_TILE_LOCKS = {}
 _PLOT_LOCK = threading.Lock()
 _PLOT_FIG = None
 _PLOT_AX = None
@@ -386,6 +388,15 @@ def plan_linz_clip(lat, lon, size_m=None, snap_m=None):
     }
 
 
+def _linz_tile_lock(code):
+    with _TILE_LOCKS_GUARD:
+        lock = _TILE_LOCKS.get(code)
+        if lock is None:
+            lock = threading.Lock()
+            _TILE_LOCKS[code] = lock
+        return lock
+
+
 def _head_linz_tile_size(url):
     try:
         response = requests.head(
@@ -404,6 +415,17 @@ def _head_linz_tile_size(url):
 
 def iter_download_linz_tile(code):
     """Download one full Topo50 GeoTIFF into linz_tile_dir(). Yields (fraction, message)."""
+    lock = _linz_tile_lock(code)
+    if not lock.acquire(blocking=False):
+        yield 0.05, f"Waiting for {code}"
+        lock.acquire()
+    try:
+        yield from _iter_download_linz_tile_locked(code)
+    finally:
+        lock.release()
+
+
+def _iter_download_linz_tile_locked(code):
     dest = linz_tile_path(code)
     dest.parent.mkdir(parents=True, exist_ok=True)
     url = linz_tile_url(code)
@@ -420,6 +442,19 @@ def iter_download_linz_tile(code):
             pass
 
     existing = part.stat().st_size if part.exists() else 0
+    if expected is not None and existing:
+        if existing == expected:
+            part.replace(dest)
+            yield 1.0, f"Saved {code}"
+            return
+        if existing > expected:
+            logging.info("Discarding oversized partial LINZ tile %s (%s bytes)", code, existing)
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            existing = 0
+
     headers = dict(LINZ_HTTP_HEADERS)
     if existing > 0:
         headers["Range"] = f"bytes={existing}-"
@@ -431,6 +466,18 @@ def iter_download_linz_tile(code):
             timeout=LINZ_HTTP_TIMEOUT,
             headers=headers,
         ) as response:
+            if existing > 0 and response.status_code == 416:
+                if expected is not None and part.exists() and part.stat().st_size == expected:
+                    part.replace(dest)
+                    yield 1.0, f"Saved {code}"
+                    return
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                raise HydroScreenError(
+                    f"Could not resume LINZ tile {code}. Run again to download it from the start."
+                )
             if existing > 0 and response.status_code == 200:
                 existing = 0
             elif existing > 0 and response.status_code != 206:

@@ -101,7 +101,49 @@ class LinzTileDownloadTests(unittest.TestCase):
         self.assertIn("BX24.tiff", url)
         self.assertNotIn("/vsicurl/", url)
 
-    def test_incomplete_file_is_left_for_resume(self):
+    def test_discards_an_oversized_partial_file(self):
+        payload = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" * 8
+        seen = {}
+
+        def fake_get(url, stream=False, timeout=None, headers=None):
+            seen["range"] = (headers or {}).get("Range")
+            return FakeResponse(payload, status_code=200)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"HYDROBRIDGE_LINZ_TILES": tmp}):
+                part = Path(str(linz_tile_path("BX24")) + ".part")
+                part.write_bytes(payload + b"EXTRA")
+                with patch("hydroscreen._head_linz_tile_size", return_value=len(payload)):
+                    with patch("hydroscreen.requests.get", side_effect=fake_get):
+                        list(iter_download_linz_tile("BX24"))
+                dest = linz_tile_path("BX24")
+                self.assertEqual(dest.read_bytes(), payload)
+                self.assertFalse(part.exists())
+        self.assertIsNone(seen.get("range"))
+
+    def test_one_sheet_is_only_fetched_once_when_two_callers_overlap(self):
+        payload = b"SHARED-TILE" * 50
+        calls = []
+
+        def fake_get(url, stream=False, timeout=None, headers=None):
+            calls.append(url)
+            return FakeResponse(payload, status_code=200)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict("os.environ", {"HYDROBRIDGE_LINZ_TILES": tmp}):
+                with patch("hydroscreen._head_linz_tile_size", return_value=len(payload)):
+                    with patch("hydroscreen.requests.get", side_effect=fake_get):
+                        from concurrent.futures import ThreadPoolExecutor
+
+                        def worker():
+                            return list(iter_download_linz_tile("BX24"))
+
+                        with ThreadPoolExecutor(max_workers=2) as pool:
+                            list(pool.map(lambda _: worker(), range(2)))
+                dest = linz_tile_path("BX24")
+                self.assertTrue(dest.exists())
+                self.assertEqual(dest.read_bytes(), payload)
+        self.assertEqual(len(calls), 1)
         payload = b"0123456789" * 30
 
         def fake_get(url, stream=False, timeout=None, headers=None):

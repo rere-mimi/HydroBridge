@@ -21,6 +21,7 @@
 html, body {
   margin: 0;
   height: 100%;
+  height: 100dvh;
   color: var(--ink);
   background: #0b1220;
   font: 15px/1.45 "Segoe UI", system-ui, sans-serif;
@@ -29,15 +30,22 @@ html, body {
 body {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+}
+
+body.has-results {
+  overflow: auto;
+  height: auto;
   min-height: 100dvh;
 }
 
 .app-frame {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 100dvh;
-  min-height: 100vh;
+  flex: 0 0 auto;
+  height: 100dvh;
+  height: 100vh;
+  min-height: 0;
 }
 
 .workspace {
@@ -79,6 +87,8 @@ body {
 #map {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
   z-index: 0;
 }
 
@@ -91,12 +101,6 @@ body {
 }
 
 [hidden] { display: none !important; }
-
-#map {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-}
 
 body.mode-draw #map,
 body.mode-xs #map {
@@ -339,6 +343,8 @@ body.is-busy .mark {
   display: flex;
   overflow: hidden;
   width: max-content;
+  flex: 0 0 auto;
+  align-self: flex-start;
   border: 1px solid rgba(255,255,255,0.65);
   border-radius: 999px;
   background: var(--panel);
@@ -784,7 +790,7 @@ th, td {
   .rail-start {
     flex-direction: row;
     flex-wrap: wrap;
-    align-items: stretch;
+    align-items: flex-start;
   }
   .coach { flex: 1 1 16rem; }
   .legend:not(.has-dem) { display: none; }
