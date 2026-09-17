@@ -18,6 +18,7 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="run-status"', html)
         self.assertIn("novalidate", html)
         self.assertIn('id="busy"', html)
+        self.assertIn("500 m", html)
         self.assertIn("busy-spinner", html)
         self.assertNotIn("disabled>Run screening", html)
 

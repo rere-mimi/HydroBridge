@@ -175,6 +175,7 @@ def dem_preview():
         "bounds": [[south, west], [north, east]],
         "source": result["source"],
         "radius_m": result["radius_m"],
+        "clip_size_m": result.get("clip_size_m"),
         "opacity": 0.5,
     })
 
@@ -199,6 +200,16 @@ def cross_section():
     if spacing <= 0:
         return jsonify({"error": "Sample spacing must be greater than 0."}), 400
 
+    site_lat = site_lon = None
+    try:
+        if request.form.get("lat") not in (None, "") and request.form.get("lon") not in (None, ""):
+            site_lat = float(request.form.get("lat"))
+            site_lon = float(request.form.get("lon"))
+            if not (-90 <= site_lat <= 90 and -180 <= site_lon <= 180):
+                site_lat = site_lon = None
+    except (TypeError, ValueError):
+        site_lat = site_lon = None
+
     dem_source = (request.form.get("dem_source") or "linz").strip()
     dem_path = None
     cleanup = None
@@ -221,7 +232,14 @@ def cross_section():
 
     try:
         profile = sample_drawn_cross_section(
-            lon1, lat1, lon2, lat2, dem_path=dem_path, spacing_m=spacing
+            lon1,
+            lat1,
+            lon2,
+            lat2,
+            dem_path=dem_path,
+            spacing_m=spacing,
+            site_lat=site_lat,
+            site_lon=site_lon,
         )
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400

@@ -59,9 +59,11 @@ LINZ_LIDAR_1M_BASE = (
     "https://nz-elevation.s3-ap-southeast-2.amazonaws.com/new-zealand/new-zealand/dem_1m/2193/"
 )
 LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
-MAX_DEM_RADIUS_M = 2000.0
+DEM_CLIP_SIZE_M = 500.0
+DEM_CLIP_SNAP_M = 20.0
+MAX_DEM_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_PREVIEW_MAX_PX = 640
-DEM_PREVIEW_MIN_RADIUS_M = 800.0
+DEM_PREVIEW_MIN_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_CACHE_MAX_FILES = 12
 _CACHE_LOCK = threading.Lock()
 _PLOT_LOCK = threading.Lock()
@@ -133,9 +135,13 @@ def expand_bbox_for_cache(bbox, step=0.005):
     return (snap_down(minx), snap_down(miny), snap_up(maxx), snap_up(maxy))
 
 
-def _cache_file_for(bbox, resolution):
-    minx, miny, maxx, maxy = expand_bbox_for_cache(bbox)
+def _cache_file_for(bbox, resolution, bounds_2193=None):
     res = 0 if resolution is None else round(float(resolution), 2)
+    if bounds_2193 is not None:
+        west, south, east, north = (round(float(v), 1) for v in bounds_2193)
+        name = f"nztm_{west:.1f}_{south:.1f}_{east:.1f}_{north:.1f}_{res:g}.tif"
+        return dem_cache_dir() / name
+    minx, miny, maxx, maxy = expand_bbox_for_cache(bbox)
     name = f"{minx:.5f}_{miny:.5f}_{maxx:.5f}_{maxy:.5f}_{res:g}.tif"
     return dem_cache_dir() / name
 
@@ -166,6 +172,43 @@ def bbox_from_point(lat, lon, buffer_m):
     lon_min, lat_min = transformer_to_4326.transform(minx, miny)
     lon_max, lat_max = transformer_to_4326.transform(maxx, maxy)
     return min(lon_min, lon_max), min(lat_min, lat_max), max(lon_min, lon_max), max(lat_min, lat_max)
+
+
+def square_clip_2193(lat, lon, size_m=None, snap_m=None):
+    """Axis-aligned size_m × size_m window in NZTM (EPSG:2193), centred on the pin.
+
+    The pin is snapped to snap_m so nearby clicks reuse one cached LiDAR clip.
+    """
+    size_m = DEM_CLIP_SIZE_M if size_m is None else float(size_m)
+    snap_m = DEM_CLIP_SNAP_M if snap_m is None else float(snap_m)
+    if size_m <= 0:
+        raise HydroScreenError("DEM clip size must be greater than 0.")
+    x, y = _transformer("EPSG:4326", "EPSG:2193").transform(float(lon), float(lat))
+    if snap_m > 0:
+        x = round(x / snap_m) * snap_m
+        y = round(y / snap_m) * snap_m
+    half = size_m / 2.0
+    return (x - half, y - half, x + half, y + half)
+
+
+def bbox_4326_from_2193(bounds_2193):
+    """Geographic envelope of an NZTM window (minLon, minLat, maxLon, maxLat)."""
+    west, south, east, north = (float(v) for v in bounds_2193)
+    to_4326 = _transformer("EPSG:2193", "EPSG:4326")
+    corners = [
+        to_4326.transform(west, south),
+        to_4326.transform(west, north),
+        to_4326.transform(east, south),
+        to_4326.transform(east, north),
+    ]
+    lons = [c[0] for c in corners]
+    lats = [c[1] for c in corners]
+    return (min(lons), min(lats), max(lons), max(lats))
+
+
+def square_clip_bbox_4326(lat, lon, size_m=None, snap_m=None):
+    """WGS84 envelope of the NZTM square clip around the pin."""
+    return bbox_4326_from_2193(square_clip_2193(lat, lon, size_m=size_m, snap_m=snap_m))
 
 # DEM acquisition
 
@@ -329,10 +372,15 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
     return out_tif
 
 
-def download_linz_lidar_1m(bbox, out_tif, resolution=None):
-    """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif."""
-    bbox = expand_bbox_for_cache(bbox)
-    cache_file = _cache_file_for(bbox, resolution)
+def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None):
+    """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif.
+
+    When bounds_2193 is set, the GeoTIFF is clipped to that exact NZTM window
+    (used for the 500 m site square) and is not grown for cache snapping.
+    """
+    if bounds_2193 is None:
+        bbox = expand_bbox_for_cache(bbox)
+    cache_file = _cache_file_for(bbox, resolution, bounds_2193=bounds_2193)
     out_path = Path(out_tif)
     with _CACHE_LOCK:
         if cache_file.exists() and cache_file.stat().st_size > 256:
@@ -348,12 +396,15 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None):
             "This site is outside the New Zealand LiDAR 1m DEM coverage "
             f"({LINZ_LIDAR_1M_LAYER})."
         )
-    transformer = _transformer("EPSG:4326", "EPSG:2193")
-    minx, miny, maxx, maxy = bbox
-    x1, y1 = transformer.transform(minx, miny)
-    x2, y2 = transformer.transform(maxx, maxy)
-    west, east = min(x1, x2) - 2.0, max(x1, x2) + 2.0
-    south, north = min(y1, y2) - 2.0, max(y1, y2) + 2.0
+    if bounds_2193 is not None:
+        west, south, east, north = (float(v) for v in bounds_2193)
+    else:
+        transformer = _transformer("EPSG:4326", "EPSG:2193")
+        minx, miny, maxx, maxy = bbox
+        x1, y1 = transformer.transform(minx, miny)
+        x2, y2 = transformer.transform(maxx, maxy)
+        west, east = min(x1, x2) - 2.0, max(x1, x2) + 2.0
+        south, north = min(y1, y2) - 2.0, max(y1, y2) + 2.0
     uris = [f"/vsicurl/{LINZ_LIDAR_1M_BASE}{code}.tiff" for code in codes]
     logging.info(
         "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
@@ -372,8 +423,8 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None):
 
 
 def screening_dem_radius_m(buffer, along_m, length):
-    needed = max(float(buffer), float(along_m) / 2.0 + float(length) / 2.0 + 50.0)
-    return min(max(needed, 200.0), MAX_DEM_RADIUS_M)
+    """Half-side of the site DEM clip. Window size is fixed; args kept for callers."""
+    return DEM_CLIP_SIZE_M / 2.0
 
 
 def _colorize_elevation(z):
@@ -439,9 +490,9 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
 
 def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
     """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
-    radius = max(screening_dem_radius_m(buffer, along_m, length), DEM_PREVIEW_MIN_RADIUS_M)
-    radius = min(radius, MAX_DEM_RADIUS_M)
-    bbox = bbox_from_point(lat, lon, radius)
+    bounds_2193 = square_clip_2193(lat, lon)
+    bbox = bbox_4326_from_2193(bounds_2193)
+    radius = DEM_CLIP_SIZE_M / 2.0
     temp_dir = None
     src_path = dem_path
     source = "local"
@@ -449,8 +500,7 @@ def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, bu
         if src_path is None:
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
-            resolution = max((2.0 * radius) / DEM_PREVIEW_MAX_PX, 2.0)
-            download_linz_lidar_1m(bbox, src_path, resolution=resolution)
+            download_linz_lidar_1m(bbox, src_path, bounds_2193=bounds_2193)
             source = "linz-lidar-1m"
         png, bounds = render_dem_overlay_png(src_path, bbox)
         return {
@@ -458,6 +508,7 @@ def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, bu
             "bounds": bounds,
             "source": source,
             "radius_m": float(radius),
+            "clip_size_m": DEM_CLIP_SIZE_M,
         }
     finally:
         if temp_dir:
@@ -723,7 +774,16 @@ def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=N
 MAX_XS_LENGTH_M = 2000.0
 
 
-def sample_drawn_cross_section(lon1, lat1, lon2, lat2, dem_path=None, spacing_m=1.0):
+def sample_drawn_cross_section(
+    lon1,
+    lat1,
+    lon2,
+    lat2,
+    dem_path=None,
+    spacing_m=1.0,
+    site_lat=None,
+    site_lon=None,
+):
     """Sample DEM elevations along a two-point line and return a JSON-ready profile."""
     try:
         lon1, lat1, lon2, lat2 = float(lon1), float(lat1), float(lon2), float(lat2)
@@ -747,10 +807,17 @@ def sample_drawn_cross_section(lon1, lat1, lon2, lat2, dem_path=None, spacing_m=
     source = "local"
     try:
         if dem_path is None:
-            bbox = bbox_from_lonlat_points([(lon1, lat1), (lon2, lat2)], pad_m=80.0)
+            try:
+                clip_lat = float(site_lat) if site_lat is not None else 0.5 * (lat1 + lat2)
+                clip_lon = float(site_lon) if site_lon is not None else 0.5 * (lon1 + lon2)
+            except (TypeError, ValueError):
+                clip_lat = 0.5 * (lat1 + lat2)
+                clip_lon = 0.5 * (lon1 + lon2)
+            bounds_2193 = square_clip_2193(clip_lat, clip_lon)
+            bbox = bbox_4326_from_2193(bounds_2193)
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_xs_")
             dem_path = os.path.join(temp_dir, "dem.tif")
-            download_linz_lidar_1m(bbox, dem_path)
+            download_linz_lidar_1m(bbox, dem_path, bounds_2193=bounds_2193)
             source = "linz-lidar-1m"
         dists, elevs, _coords = sample_dem_along_line(dem_path, line, spacing_m=spacing_m)
         finite = elevs[np.isfinite(elevs)]
@@ -1071,11 +1138,9 @@ def run_screening(
     dem_path = dem
     temp_dir = None
     dem_source_used = "local"
-    bbox, buffer_m = bbox_from_transects(lon, lat, transects)
-    fallback_radius = screening_dem_radius_m(buffer, along_m, length)
-    if buffer_m < 50:
-        bbox = bbox_from_point(lat, lon, fallback_radius)
-        buffer_m = fallback_radius
+    bounds_2193 = square_clip_2193(lat, lon)
+    bbox = bbox_4326_from_2193(bounds_2193)
+    buffer_m = DEM_CLIP_SIZE_M / 2.0
 
     if dem_path is None:
         check_cancelled(cancel_event)
@@ -1096,13 +1161,14 @@ def run_screening(
                 )
         if dem_path is None:
             logging.info(
-                "Clipping New Zealand LiDAR 1m DEM around the site (window ~%sm)",
-                int(buffer_m),
+                "Clipping New Zealand LiDAR 1m DEM around the site (%sm × %sm)",
+                int(DEM_CLIP_SIZE_M),
+                int(DEM_CLIP_SIZE_M),
             )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
             try:
                 dem_path = _run_interruptibly(
-                    lambda: download_linz_lidar_1m(bbox, linz_out),
+                    lambda: download_linz_lidar_1m(bbox, linz_out, bounds_2193=bounds_2193),
                     cancel_event,
                 )
                 dem_source_used = "linz-lidar-1m"
