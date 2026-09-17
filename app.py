@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import secrets
-import tempfile
 import threading
 from base64 import b64encode
 from datetime import datetime, timezone
@@ -25,7 +24,6 @@ from hydroscreen import (
 )
 
 ROOT = Path(__file__).resolve().parent
-SAMPLE_DEM = ROOT / "tests" / "fixtures" / "sample_dem.tif"
 OUTPUTS = ROOT / "outputs"
 NOMINATIM = "https://nominatim.openstreetmap.org"
 NOMINATIM_HEADERS = {"User-Agent": "HydroBridge/0.1 (hydraulic screening)"}
@@ -128,6 +126,7 @@ def _preview_payload(result):
         "source": result["source"],
         "radius_m": result["radius_m"],
         "clip_size_m": result.get("clip_size_m"),
+        "tiles": result.get("tiles") or [],
     }
 
 
@@ -141,7 +140,6 @@ def dem_preview():
         return jsonify({"error": "Enter a valid latitude and longitude, or click the map."}), 400
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
-    dem_source = (src.get("dem_source") or "linz").strip()
     try:
         along_m = float(src.get("along") or 300)
         length = float(src.get("length") or 200)
@@ -150,31 +148,11 @@ def dem_preview():
     if along_m < 0 or length <= 0:
         return jsonify({"error": "Transect length and length along the river must be greater than 0."}), 400
 
-    dem_path = None
-    if dem_source == "sample":
-        if not SAMPLE_DEM.exists():
-            return jsonify({"error": "Bundled sample DEM is missing."}), 500
-        dem_path = str(SAMPLE_DEM)
-    elif dem_source == "upload":
-        uploaded = request.files.get("dem")
-        if uploaded is None or not uploaded.filename:
-            return jsonify({"error": "Choose a GeoTIFF DEM to overlay."}), 400
-        suffix = Path(uploaded.filename).suffix.lower()
-        if suffix not in {".tif", ".tiff"}:
-            return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
-        tmp = Path(tempfile.gettempdir()) / f"hydroscreen-preview-{secrets.token_hex(4)}{suffix}"
-        uploaded.save(tmp)
-        dem_path = str(tmp)
-    elif dem_source != "linz":
-        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
-
     stream = (src.get("stream") or request.args.get("stream") or "").strip() == "1"
     if stream:
         def generate():
             try:
-                for event in iter_dem_preview(
-                    lat, lon, dem_path=dem_path, along_m=along_m, length=length
-                ):
+                for event in iter_dem_preview(lat, lon, along_m=along_m, length=length):
                     if event.get("done"):
                         payload = _preview_payload(event)
                         payload["percent"] = 100
@@ -195,9 +173,6 @@ def dem_preview():
                     "percent": 0,
                     "done": True,
                 }) + "\n"
-            finally:
-                if dem_source == "upload" and dem_path:
-                    Path(dem_path).unlink(missing_ok=True)
 
         return Response(
             stream_with_context(generate()),
@@ -209,17 +184,12 @@ def dem_preview():
         )
 
     try:
-        result = preview_dem_overlay(
-            lat, lon, dem_path=dem_path, along_m=along_m, length=length
-        )
+        result = preview_dem_overlay(lat, lon, along_m=along_m, length=length)
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         logging.exception("DEM preview failed")
         return jsonify({"error": f"Could not overlay the DEM: {exc}"}), 500
-    finally:
-        if dem_source == "upload" and dem_path:
-            Path(dem_path).unlink(missing_ok=True)
 
     payload = _preview_payload(result)
     payload["opacity"] = 0.5
@@ -256,33 +226,12 @@ def cross_section():
     except (TypeError, ValueError):
         site_lat = site_lon = None
 
-    dem_source = (request.form.get("dem_source") or "linz").strip()
-    dem_path = None
-    cleanup = None
-    if dem_source == "sample":
-        if not SAMPLE_DEM.exists():
-            return jsonify({"error": "Bundled sample DEM is missing."}), 500
-        dem_path = str(SAMPLE_DEM)
-    elif dem_source == "upload":
-        uploaded = request.files.get("dem")
-        if uploaded is None or not uploaded.filename:
-            return jsonify({"error": "Choose a GeoTIFF DEM to sample, or use the New Zealand LiDAR 1m DEM."}), 400
-        suffix = Path(uploaded.filename).suffix.lower()
-        if suffix not in {".tif", ".tiff"}:
-            return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
-        cleanup = Path(tempfile.gettempdir()) / f"hydroscreen-xs-{secrets.token_hex(4)}{suffix}"
-        uploaded.save(cleanup)
-        dem_path = str(cleanup)
-    elif dem_source != "linz":
-        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
-
     try:
         profile = sample_drawn_cross_section(
             lon1,
             lat1,
             lon2,
             lat2,
-            dem_path=dem_path,
             spacing_m=spacing,
             site_lat=site_lat,
             site_lon=site_lon,
@@ -292,9 +241,6 @@ def cross_section():
     except Exception as exc:
         logging.exception("Cross-section sampling failed")
         return jsonify({"error": f"Could not sample the DEM: {exc}"}), 500
-    finally:
-        if cleanup is not None:
-            cleanup.unlink(missing_ok=True)
     return jsonify(profile)
 
 
@@ -308,30 +254,9 @@ def run():
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return jsonify({"error": "Latitude must be between -90 and 90, longitude between -180 and 180."}), 400
 
-    dem_source = (request.form.get("dem_source") or "linz").strip()
-    dem_path = None
-    uploaded = request.files.get("dem")
     run_id = _new_run_id()
     outdir = OUTPUTS / run_id
     outdir.mkdir(parents=True, exist_ok=True)
-
-    if dem_source == "upload":
-        if uploaded is None or not uploaded.filename:
-            return jsonify({"error": "Choose a GeoTIFF DEM to upload, or use the New Zealand LiDAR 1m DEM."}), 400
-        suffix = Path(uploaded.filename).suffix.lower()
-        if suffix not in {".tif", ".tiff"}:
-            return jsonify({"error": "DEM must be a GeoTIFF (.tif or .tiff)."}), 400
-        dem_path = outdir / f"upload{suffix}"
-        uploaded.save(dem_path)
-        dem_path = str(dem_path)
-    elif dem_source == "sample":
-        if not SAMPLE_DEM.exists():
-            return jsonify({"error": "Bundled sample DEM is missing."}), 500
-        dem_path = str(SAMPLE_DEM)
-    elif dem_source == "linz":
-        dem_path = None
-    else:
-        return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
 
     try:
         interval = float(request.form.get("interval") or 50)
@@ -347,9 +272,6 @@ def run():
         return jsonify({"error": "Transect length and spacing must be greater than 0."}), 400
     if mannings_n <= 0 or flow_m3_s < 0:
         return jsonify({"error": "Flow rate must be ≥ 0 and Manning's n must be greater than 0."}), 400
-
-    wcs_base = (request.form.get("wcs_base") or "").strip() or None
-    wcs_layer = (request.form.get("wcs_layer") or "").strip() or None
 
     centerline_coords = None
     raw_centerline = (request.form.get("centerline") or "").strip()
@@ -372,9 +294,6 @@ def run():
         result = run_screening(
             lat=lat,
             lon=lon,
-            dem=dem_path,
-            wcs_base=wcs_base,
-            wcs_layer=wcs_layer,
             outdir=str(outdir),
             interval=interval,
             along_m=along_m,

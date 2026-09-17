@@ -107,6 +107,7 @@ class ScreeningLinzDownloadTests(unittest.TestCase):
             self.assertGreater(kept.stat().st_size, 256)
             self.assertEqual(result["layout"]["dem_source"], "linz-lidar-1m")
             self.assertEqual(result["layout"]["dem_file"], "dem_500m.tif")
+            self.assertIn("BQ31", result["layout"]["tiles"])
             self.assertGreaterEqual(len(result["summary"]), 1)
 
     def test_long_drawn_line_is_clipped_to_the_dem(self):

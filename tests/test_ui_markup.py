@@ -1,9 +1,21 @@
 """The map UI must expose working Run and Cross-section controls."""
 
 import json
+import shutil
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from app import app
+from hydroscreen import plan_linz_clip
+
+SAMPLE_DEM = Path(__file__).resolve().parent / "fixtures" / "sample_dem.tif"
+
+
+def _fake_extract(lat, lon, out_tif, progress=None):
+    Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(SAMPLE_DEM, out_tif)
+    return str(out_tif), plan_linz_clip(lat, lon)
 
 
 class UiMarkupTests(unittest.TestCase):
@@ -24,19 +36,23 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="dem-opacity"', html)
         self.assertIn("500 m", html)
         self.assertIn("busy-spinner", html)
-        self.assertIn("screening-dem", html)
+        self.assertIn("linz-only", html)
+        self.assertIn("id=\"dem-tiles\"", html)
+        self.assertIn("LINZ 121859", html)
+        self.assertNotIn("Bundled Wellington", html)
+        self.assertNotIn("Upload a GeoTIFF", html)
         self.assertNotIn("disabled>Run screening", html)
 
     def test_dem_preview_stream_reports_percent(self):
-        response = self.client.post(
-            "/api/dem-preview?stream=1",
-            data={
-                "lat": -41.2865,
-                "lon": 174.7762,
-                "dem_source": "sample",
-                "stream": "1",
-            },
-        )
+        with patch("hydroscreen.extract_linz_dem_for_bridge", side_effect=_fake_extract):
+            response = self.client.post(
+                "/api/dem-preview?stream=1",
+                data={
+                    "lat": -41.2865,
+                    "lon": 174.7762,
+                    "stream": "1",
+                },
+            )
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True)[:500])
         events = [
             json.loads(line)
@@ -51,19 +67,20 @@ class UiMarkupTests(unittest.TestCase):
         done = events[-1]
         self.assertTrue(done.get("png"))
         self.assertTrue(done.get("bounds"))
+        self.assertIn("BQ31", done.get("tiles") or [])
 
     def test_cross_section_api_still_accepts_two_points(self):
-        response = self.client.post(
-            "/api/cross-section",
-            data={
-                "lat1": -41.2865,
-                "lon1": 174.770,
-                "lat2": -41.2865,
-                "lon2": 174.782,
-                "dem_source": "sample",
-                "sample_spacing": 5,
-            },
-        )
+        with patch("hydroscreen.extract_linz_dem_for_bridge", side_effect=_fake_extract):
+            response = self.client.post(
+                "/api/cross-section",
+                data={
+                    "lat1": -41.2865,
+                    "lon1": 174.770,
+                    "lat2": -41.2865,
+                    "lon2": 174.782,
+                    "sample_spacing": 5,
+                },
+            )
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertGreater(response.get_json()["n_samples"], 5)
 

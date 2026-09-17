@@ -65,21 +65,34 @@ class CrossSectionApiTests(unittest.TestCase):
         self.client = app.test_client()
 
     def test_requires_two_points(self):
-        response = self.client.post("/api/cross-section", data={"dem_source": "sample"})
+        response = self.client.post("/api/cross-section", data={})
         self.assertEqual(response.status_code, 400)
 
-    def test_samples_bundled_wellington_dem(self):
-        response = self.client.post(
-            "/api/cross-section",
-            data={
-                "lat1": -41.2865,
-                "lon1": 174.770,
-                "lat2": -41.2865,
-                "lon2": 174.782,
-                "dem_source": "sample",
-                "sample_spacing": 5,
-            },
-        )
+    def test_samples_linz_clip_for_the_chosen_bridge(self):
+        from unittest.mock import patch
+        import shutil
+        from hydroscreen import plan_linz_clip
+
+        fixture = Path(__file__).resolve().parent / "fixtures" / "sample_dem.tif"
+
+        def fake_extract(lat, lon, out_tif, progress=None):
+            Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(fixture, out_tif)
+            return str(out_tif), plan_linz_clip(lat, lon)
+
+        with patch("hydroscreen.extract_linz_dem_for_bridge", side_effect=fake_extract):
+            response = self.client.post(
+                "/api/cross-section",
+                data={
+                    "lat1": -41.2865,
+                    "lon1": 174.770,
+                    "lat2": -41.2865,
+                    "lon2": 174.782,
+                    "lat": -41.2865,
+                    "lon": 174.7762,
+                    "sample_spacing": 5,
+                },
+            )
         self.assertEqual(response.status_code, 200, response.get_json())
         data = response.get_json()
         self.assertGreater(data["n_samples"], 5)
