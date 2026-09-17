@@ -733,6 +733,22 @@ button { font: inherit; cursor: pointer; }
 
 .xs-viewer[hidden] { display: none !important; }
 
+.xs-measure {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 2500;
+  pointer-events: none;
+  padding: 0.22rem 0.5rem;
+  border-radius: 999px;
+  background: #5b21b6;
+  color: #fff;
+  font: 700 0.78rem/1.25 "Segoe UI", system-ui, sans-serif;
+  letter-spacing: 0.01em;
+  box-shadow: 0 6px 16px rgba(91, 33, 182, 0.32);
+  white-space: nowrap;
+}
+
 .xs-head {
   display: flex;
   justify-content: space-between;

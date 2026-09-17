@@ -38,6 +38,7 @@ const xsViewer = document.getElementById("xs-viewer");
 const xsMeta = document.getElementById("xs-meta");
 const xsTitle = document.getElementById("xs-title");
 const xsCanvas = document.getElementById("xs-canvas");
+const xsMeasureEl = document.getElementById("xs-measure");
 const busyEl = document.getElementById("busy");
 const busyText = document.getElementById("busy-text");
 const busyPct = document.getElementById("busy-pct");
@@ -719,6 +720,37 @@ function drawXsLine() {
   refreshLegend();
 }
 
+function formatXsDistance(metres) {
+  const value = Number(metres);
+  if (!Number.isFinite(value) || value < 0) return "0.0 m";
+  if (value < 100) return `${value.toFixed(1)} m`;
+  return `${Math.round(value)} m`;
+}
+
+function pointerFromMapEvent(event) {
+  const src = event && (event.originalEvent || event);
+  if (!src || !Number.isFinite(src.clientX) || !Number.isFinite(src.clientY)) return null;
+  return { x: src.clientX, y: src.clientY };
+}
+
+function hideXsMeasure() {
+  if (!xsMeasureEl) return;
+  xsMeasureEl.hidden = true;
+}
+
+function updateXsMeasure(latlng, pointer) {
+  if (!xsMeasureEl) return;
+  if (mode !== "xs" || xsPoints.length !== 1 || !latlng) {
+    hideXsMeasure();
+    return;
+  }
+  xsMeasureEl.textContent = formatXsDistance(map.distance(xsPoints[0], latlng));
+  xsMeasureEl.hidden = false;
+  if (pointer) {
+    xsMeasureEl.style.transform = `translate(${pointer.x + 14}px, ${pointer.y + 12}px)`;
+  }
+}
+
 function clearXsChart() {
   if (!xsCanvas) return;
   const ctx = xsCanvas.getContext("2d");
@@ -1084,6 +1116,7 @@ function resetXsDrawing({ keepViewer = false } = {}) {
   xsProfile = null;
   xsDraftLine.setLatLngs([]);
   xsLayer.clearLayers();
+  hideXsMeasure();
   refreshLegend();
   if (keepViewer) {
     clearXsChart();
@@ -1136,6 +1169,7 @@ function handleXsClick(latlng) {
     xsPoints = [];
     xsDraftLine.setLatLngs([]);
     xsLayer.clearLayers();
+    hideXsMeasure();
     setXsMeta("Click the second point. The profile will regenerate.");
   }
   if (xsPoints.length === 1 && map.distance(xsPoints[0], latlng) < 5) {
@@ -1144,8 +1178,8 @@ function handleXsClick(latlng) {
   xsPoints.push(L.latLng(latlng.lat, latlng.lng));
   drawXsLine();
   if (xsPoints.length === 1) {
-    setCoach("Click the second point on the DEM.");
-    setStatus("First cross-section point placed. Click the second point.", "ok");
+    setCoach("Click the second point on the DEM. Distance follows the cursor.");
+    setStatus("First cross-section point placed. Move to see the distance, then click the second point.", "ok");
     showXsViewer();
     if (!xsProfile) {
       clearXsChart();
@@ -1153,6 +1187,7 @@ function handleXsClick(latlng) {
     }
     return;
   }
+  hideXsMeasure();
   xsDraftLine.setLatLngs([]);
   setCoach("Cross-section ready. Click two new points to replace it, or set hydrology parameters.");
   requestXsProfile(xsPoints[0], xsPoints[1]);
@@ -1165,6 +1200,7 @@ function setMode(next) {
   modeDrawBtn.setAttribute("aria-pressed", String(mode === "draw"));
   modeXsBtn.setAttribute("aria-pressed", String(mode === "xs"));
   drawingStroke = false;
+  if (mode !== "xs" || xsPoints.length !== 1) hideXsMeasure();
   if (mode === "draw") {
     map.dragging.disable();
     setCoach("Click or drag along the river through the bridge. Double-click the last point when the line is done.");
@@ -1172,7 +1208,7 @@ function setMode(next) {
     map.dragging.disable();
     setCoach(
       xsPoints.length === 1
-        ? "Click the second point on the DEM."
+        ? "Click the second point on the DEM. Distance follows the cursor."
         : "Cross-section tool is on. Left-click two points on the map to sample the DEM."
     );
     setStatus("Cross-section tool is on. Click two points on the map.", "ok");
@@ -1480,6 +1516,9 @@ function applyMapClick(latlng) {
 
 map.on("click", (event) => {
   applyMapClick(event.latlng);
+  if (mode === "xs" && xsPoints.length === 1) {
+    updateXsMeasure(event.latlng, pointerFromMapEvent(event));
+  }
 });
 
 map.on("dblclick", (event) => {
@@ -1502,8 +1541,10 @@ map.on("mousedown", (event) => {
 map.on("mousemove", (event) => {
   if (mode === "xs" && xsPoints.length === 1) {
     xsDraftLine.setLatLngs([xsPoints[0], event.latlng]);
+    updateXsMeasure(event.latlng, pointerFromMapEvent(event));
     return;
   }
+  hideXsMeasure();
   if (mode !== "draw" || !drawingStroke) return;
   addVertex(event.latlng);
 });
@@ -1514,6 +1555,7 @@ map.on("mouseup", () => {
 
 map.getContainer().addEventListener("mouseleave", () => {
   drawingStroke = false;
+  hideXsMeasure();
 });
 
 nameForm.addEventListener("submit", (event) => {
