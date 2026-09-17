@@ -426,14 +426,30 @@ function closeHelp() {
 }
 
 function aoiExtents() {
+  const clamp = (value) => (Number.isFinite(value) && value >= 10 && value <= 5000 ? value : 250);
   const up = Number(runForm.upstream && runForm.upstream.value);
   const down = Number(runForm.downstream && runForm.downstream.value);
   const side = Number(runForm.lateral && runForm.lateral.value);
   return {
-    upstream: Number.isFinite(up) && up >= 10 ? up : 250,
-    downstream: Number.isFinite(down) && down >= 10 ? down : 250,
-    lateral: Number.isFinite(side) && side >= 10 ? side : 250,
+    upstream: clamp(up),
+    downstream: clamp(down),
+    lateral: clamp(side),
   };
+}
+
+function aoiWindowM() {
+  const ext = aoiExtents();
+  return {
+    along: ext.upstream + ext.downstream,
+    width: 2 * ext.lateral,
+  };
+}
+
+function updateAoiSize() {
+  const el = document.getElementById("aoi-size");
+  if (!el) return;
+  const { along, width } = aoiWindowM();
+  el.textContent = `LiDAR window ${along.toFixed(0)} m along × ${width.toFixed(0)} m across (max 5,000 m per side).`;
 }
 
 function offsetLatLng(origin, eastM, northM) {
@@ -615,6 +631,7 @@ function updateLayoutPreview() {
   const spacing = Number(runForm.sample_spacing.value);
   alongInput.value = along > 0 ? String(Math.round(along)) : "300";
   analysisLengthEl.textContent = along >= 2 ? `${along.toFixed(0)} m` : "—";
+  updateAoiSize();
   if (along < 2) {
     layoutPreview.textContent = "Draw the centreline to set the analysis length.";
     runReady = false;
@@ -656,6 +673,9 @@ function updateLayoutPreview() {
     }
   }
   layoutPreview.textContent = `${nTransects} transects along the drawn ${along.toFixed(0)} m · ${nSamples} DEM points each · ${ariNote}${extra}`;
+  const windowM = aoiWindowM();
+  layoutPreview.textContent = `${layoutPreview.textContent} · DEM ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m`;
+  updateAoiSize();
   runReady = Boolean(marker);
   runBlockReason = marker
     ? ""
@@ -770,7 +790,14 @@ async function refreshDemOverlay() {
   body.set("length", runForm.length.value);
   body.set("stream", "1");
   appendAoiFields(body);
-  showDemProgress(0, "Finding LINZ tiles…");
+  const windowM = aoiWindowM();
+  const large = windowM.along * windowM.width > 500 * 500;
+  showDemProgress(
+    0,
+    large
+      ? `Fetching a ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m LiDAR window…`
+      : "Finding LINZ tiles…"
+  );
   try {
     const res = await fetch("/api/dem-preview?stream=1", { method: "POST", body });
     const data = await readPreviewStream(res);

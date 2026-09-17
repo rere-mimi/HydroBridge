@@ -70,6 +70,7 @@ AOI_MIN_M = 10.0
 AOI_MAX_M = 5000.0
 MAX_DEM_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_PREVIEW_MAX_PX = 640
+DEM_MAX_PIXELS = 20_000_000
 DEM_PREVIEW_MIN_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_CACHE_MAX_FILES = 12
 _CACHE_LOCK = threading.Lock()
@@ -251,6 +252,20 @@ def parse_aoi_extent(value, default=None, name="extent"):
             f"{name} must be between {int(AOI_MIN_M)} and {int(AOI_MAX_M)} m."
         )
     return extent_m
+
+
+def aoi_native_pixels(along_m, width_m, resolution=1.0):
+    """How many cells a window uses at the given ground resolution."""
+    step = max(float(resolution or 1.0), 1e-6)
+    cols = max(1, int(math.ceil(float(width_m) / step)))
+    rows = max(1, int(math.ceil(float(along_m) / step)))
+    return rows * cols
+
+
+def preview_resolution_m(along_m, width_m, max_px=DEM_PREVIEW_MAX_PX):
+    """Ground sample distance so a map preview stays around max_px on a side."""
+    longest = max(float(along_m), float(width_m), 1.0)
+    return max(1.0, longest / float(max_px))
 
 
 def _unit_vector(dx, dy, fallback=(0.0, -1.0)):
@@ -509,7 +524,7 @@ def _configure_gdal_http():
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "4")
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
-    os.environ.setdefault("GDAL_HTTP_TIMEOUT", "60")
+    os.environ.setdefault("GDAL_HTTP_TIMEOUT", "120")
     os.environ.setdefault("GDAL_HTTP_CONNECTTIMEOUT", "20")
     os.environ.setdefault("GDAL_HTTP_VERSION", "1.1")
     os.environ.setdefault("GDAL_CACHEMAX", "256")
@@ -738,6 +753,7 @@ def iter_extract_linz_dem_for_bridge(
     downstream_m=None,
     lateral_m=None,
     centerline_coords=None,
+    resolution=None,
 ):
     """Identify intersecting COGs and crop the AOI window; do not download whole tiles."""
     yield {"percent": 2, "message": "Finding DEM tiles"}
@@ -754,13 +770,24 @@ def iter_extract_linz_dem_for_bridge(
             "This site is outside the New Zealand LiDAR 1m DEM coverage "
             f"({LINZ_LIDAR_1M_LAYER})."
         )
+    step = None if resolution is None else float(resolution)
+    pixels = aoi_native_pixels(plan["along_m"], plan["width_m"], step or 1.0)
+    if step is None and pixels > DEM_MAX_PIXELS:
+        raise HydroScreenError(
+            f"This LiDAR window is about {plan['along_m']:.0f} m along × "
+            f"{plan['width_m']:.0f} m across ({pixels / 1e6:.1f} million 1 m cells). "
+            f"That is too large to crop. Each of upstream, downstream, and lateral "
+            f"must be between {int(AOI_MIN_M)} and {int(AOI_MAX_M)} m. "
+            "1,500 m × 1,000 m is 750 m up, 750 m down, and 500 m each side."
+        )
     logging.info(
-        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (AOI %.0f m along × %.0f m wide)",
+        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (AOI %.0f m along × %.0f m wide%s)",
         plan["lat"],
         plan["lon"],
         ", ".join(plan["tiles"]),
         plan["along_m"],
         plan["width_m"],
+        "" if step is None else f", {step:.1f} m preview cells",
     )
     sheets = ", ".join(plan["tiles"])
     yield {
@@ -769,7 +796,7 @@ def iter_extract_linz_dem_for_bridge(
         "plan": plan,
     }
 
-    cache_file = _cache_file_for_aoi(plan)
+    cache_file = _cache_file_for_aoi(plan, resolution=step)
     out_path = Path(out_tif)
     with _CACHE_LOCK:
         if cache_file.exists() and cache_file.stat().st_size > 256:
@@ -786,13 +813,20 @@ def iter_extract_linz_dem_for_bridge(
             return
 
     uris = linz_window_uris(plan)
-    yield {"percent": 12, "message": "Clipping DEM to the area of interest", "plan": plan}
+    along = float(plan["along_m"])
+    wide = float(plan["width_m"])
+    yield {
+        "percent": 12,
+        "message": f"Clipping a {along:.0f} × {wide:.0f} m DEM window",
+        "plan": plan,
+    }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     clip_dem_tiles(
         uris,
         plan["bounds_2193"],
         str(out_path),
         geometry=aoi_polygon_2193(plan),
+        resolution=step,
     )
     with _CACHE_LOCK:
         try:
@@ -814,6 +848,7 @@ def extract_linz_dem_for_bridge(
     downstream_m=None,
     lateral_m=None,
     centerline_coords=None,
+    resolution=None,
 ):
     """Crop intersecting LINZ COGs to the AOI rectangle. Returns (path, plan)."""
     path = None
@@ -826,6 +861,7 @@ def extract_linz_dem_for_bridge(
         downstream_m=downstream_m,
         lateral_m=lateral_m,
         centerline_coords=centerline_coords,
+        resolution=resolution,
     ):
         plan = event.get("plan") or plan
         if progress is not None and "percent" in event:
@@ -882,7 +918,20 @@ def clip_dem_tiles(
         }
         if resolution is not None:
             merge_kw["res"] = (float(resolution), float(resolution))
-        mosaic, transform = raster_merge(datasets, **merge_kw)
+        try:
+            mosaic, transform = raster_merge(datasets, **merge_kw)
+        except MemoryError as exc:
+            raise HydroScreenError(
+                "This DEM window is too large to crop in memory. "
+                f"Each of upstream, downstream, and lateral can be at most {int(AOI_MAX_M)} m. "
+                "A 1,500 m × 1,000 m window is 750 m up, 750 m down, and 500 m each side."
+            ) from exc
+        except Exception as exc:
+            logging.exception("DEM tile merge failed")
+            raise HydroScreenError(
+                "Could not crop the New Zealand LiDAR 1m DEM for this window. "
+                "Check the area of interest size (max 5,000 m per side) and try again."
+            ) from exc
         data = mosaic[0]
         if geometry is not None:
             geom = mapping(geometry) if hasattr(geometry, "__geo_interface__") else geometry
@@ -1105,6 +1154,7 @@ def iter_dem_preview(
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
             used = None
+            preview_step = preview_resolution_m(plan["along_m"], plan["width_m"])
             try:
                 for event in iter_extract_linz_dem_for_bridge(
                     lat,
@@ -1114,6 +1164,7 @@ def iter_dem_preview(
                     downstream_m=downstream_m,
                     lateral_m=lateral_m,
                     centerline_coords=centerline_coords,
+                    resolution=preview_step,
                 ):
                     yield {
                         "percent": int(event.get("percent") or 0),
