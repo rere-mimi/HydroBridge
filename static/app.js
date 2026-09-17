@@ -925,8 +925,11 @@ function renderResults(payload) {
     const flow = payload.layout.flow_m3_s != null
       ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${Number(payload.layout.slope).toExponential(2)}.`
       : "";
+    const clipM = payload.layout.clip_size_m != null
+      ? `, ${Number(payload.layout.clip_size_m).toFixed(0)} m clip`
+      : "";
     const dem = payload.layout.dem_source === "linz-lidar-1m"
-      ? " Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859)."
+      ? ` Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859${clipM}).`
       : "";
     resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}${dem}`;
   }
@@ -1181,7 +1184,7 @@ runForm.addEventListener("submit", async (event) => {
   runJobId = jobId;
   runAbort = new AbortController();
   setRunning(true);
-  setStatus("Running screening… Click Stop to change parameters and run again.");
+  setStatus("Downloading the 500 m LiDAR clip and running screening… Click Stop to change parameters and run again.");
   try {
     const res = await fetch("/api/run", {
       method: "POST",
