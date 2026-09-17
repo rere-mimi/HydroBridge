@@ -1,5 +1,6 @@
-"""Drawn centreline length is the analysis reach."""
+"""Drawn centreline length is the analysis reach, plus 50 m at each end."""
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +9,76 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 from shapely.geometry import LineString
+from pyproj import Transformer
 
-from hydroscreen import generate_transects, projected_length_m, run_screening
+from hydroscreen import (
+    CENTERLINE_END_BUFFER_M,
+    apply_centerline_end_buffers,
+    extend_centerline_ends,
+    generate_transects,
+    projected_length_m,
+    run_screening,
+)
+
+
+WELLINGTON = (-41.2865, 174.7762)
+
+
+class ExtendCenterlineEndsTests(unittest.TestCase):
+    def test_extends_50m_along_a_diagonal_channel_not_map_axes(self):
+        lat, lon = WELLINGTON
+        coords = [[lon - 0.002, lat - 0.001], [lon + 0.002, lat + 0.001]]
+        extended = extend_centerline_ends(coords)
+        self.assertEqual(len(extended), 4)
+        to_2193 = Transformer.from_crs("EPSG:4326", "EPSG:2193", always_xy=True)
+        p0 = to_2193.transform(coords[0][0], coords[0][1])
+        p1 = to_2193.transform(coords[1][0], coords[1][1])
+        up = to_2193.transform(extended[0][0], extended[0][1])
+        down = to_2193.transform(extended[-1][0], extended[-1][1])
+        self.assertAlmostEqual(math.hypot(up[0] - p0[0], up[1] - p0[1]), CENTERLINE_END_BUFFER_M, delta=0.05)
+        self.assertAlmostEqual(math.hypot(down[0] - p1[0], down[1] - p1[1]), CENTERLINE_END_BUFFER_M, delta=0.05)
+        seg = (p1[0] - p0[0], p1[1] - p0[1])
+        ext_up = (up[0] - p0[0], up[1] - p0[1])
+        mag_s = math.hypot(*seg)
+        mag_e = math.hypot(*ext_up)
+        self.assertAlmostEqual((ext_up[0] * seg[0] + ext_up[1] * seg[1]) / (mag_s * mag_e), -1.0, places=5)
+        self.assertGreater(abs(up[0] - p0[0]), 15)
+        self.assertGreater(abs(up[1] - p0[1]), 15)
+
+    def test_northbound_line_extends_south_of_the_first_point(self):
+        lat, lon = WELLINGTON
+        to_2193 = Transformer.from_crs("EPSG:4326", "EPSG:2193", always_xy=True)
+        to_4326 = Transformer.from_crs("EPSG:2193", "EPSG:4326", always_xy=True)
+        ox, oy = to_2193.transform(lon, lat)
+        coords = [
+            list(to_4326.transform(ox, oy - 100.0)),
+            list(to_4326.transform(ox, oy + 100.0)),
+        ]
+        extended = extend_centerline_ends(coords)
+        p0 = to_2193.transform(coords[0][0], coords[0][1])
+        p1 = to_2193.transform(coords[1][0], coords[1][1])
+        up = to_2193.transform(extended[0][0], extended[0][1])
+        down = to_2193.transform(extended[-1][0], extended[-1][1])
+        self.assertAlmostEqual(up[0], p0[0], delta=0.05)
+        self.assertLess(up[1], p0[1])
+        self.assertAlmostEqual(abs(up[1] - p0[1]), CENTERLINE_END_BUFFER_M, delta=0.05)
+        self.assertAlmostEqual(down[0], p1[0], delta=0.05)
+        self.assertGreater(down[1], p1[1])
+        self.assertAlmostEqual(abs(down[1] - p1[1]), CENTERLINE_END_BUFFER_M, delta=0.05)
+
+    def test_grows_short_aoi_limits_and_keeps_larger_user_limits(self):
+        lat, lon = WELLINGTON
+        coords = [[lon - 0.004, lat], [lon + 0.004, lat]]
+        _extended, upstream_m, downstream_m = apply_centerline_end_buffers(
+            lat, lon, coords, upstream_m=80, downstream_m=80
+        )
+        self.assertGreater(upstream_m, 300)
+        self.assertGreater(downstream_m, 300)
+        _extended, upstream_m, downstream_m = apply_centerline_end_buffers(
+            lat, lon, coords, upstream_m=2000, downstream_m=1800
+        )
+        self.assertAlmostEqual(upstream_m, 2000.0)
+        self.assertAlmostEqual(downstream_m, 1800.0)
 
 
 class CoverFullLineTests(unittest.TestCase):
@@ -43,7 +112,7 @@ class CoverFullLineTests(unittest.TestCase):
     def test_run_screening_uses_drawn_length_instead_of_along_m(self):
         west, north = 174.770, -41.280
         res = 0.0001
-        height, width = 40, 80
+        height, width = 60, 160
         grid = np.zeros((height, width), dtype=np.float32)
         for col in range(width):
             grid[:, col] = 30.0 - 0.1 * col
@@ -52,10 +121,11 @@ class CoverFullLineTests(unittest.TestCase):
         lon = west + (width / 2) * res
         lat = north - (height / 2) * res
         centerline = [
-            [west + 5 * res, lat],
-            [west + (width - 5) * res, lat],
+            [west + 20 * res, lat],
+            [west + (width - 20) * res, lat],
         ]
-        expected = projected_length_m(LineString(centerline))
+        expected_drawn = projected_length_m(LineString(centerline))
+        expected = projected_length_m(LineString(extend_centerline_ends(centerline)))
         with tempfile.TemporaryDirectory() as tmp:
             dem_path = Path(tmp) / "dem.tif"
             with rasterio.open(
@@ -84,7 +154,8 @@ class CoverFullLineTests(unittest.TestCase):
                 flow_m3_s=1.0,
                 mannings_n=0.035,
             )
-        self.assertAlmostEqual(result["layout"]["along_m"], expected, delta=1.0)
+        self.assertAlmostEqual(result["layout"]["along_m"], expected, delta=2.0)
+        self.assertGreater(result["layout"]["along_m"], expected_drawn + 80)
         self.assertGreater(result["layout"]["along_m"], 200)
         self.assertGreater(result["layout"]["n_transects"], 3)
         offsets = [abs(feat["offset_m"]) for feat in result["transects"]]

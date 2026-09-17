@@ -68,6 +68,7 @@ DEM_CLIP_SNAP_M = 20.0
 AOI_DEFAULT_M = DEM_CLIP_SIZE_M / 2.0
 AOI_MIN_M = 10.0
 AOI_MAX_M = 5000.0
+CENTERLINE_END_BUFFER_M = 50.0
 MAX_DEM_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_PREVIEW_MAX_PX = 640
 DEM_MAX_PIXELS = 20_000_000
@@ -317,6 +318,105 @@ def aoi_downstream_unit_2193(lat, lon, centerline_coords=None):
 def _lonlat_from_2193(x, y):
     lon, lat = _transformer("EPSG:2193", "EPSG:4326").transform(float(x), float(y))
     return [float(lon), float(lat)]
+
+
+def _centerline_pairs_2193(coords):
+    """Parse [[lon, lat], ...] to parallel lon/lat and NZTM vertex lists."""
+    to_2193 = _transformer("EPSG:4326", "EPSG:2193")
+    lonlats = []
+    pts = []
+    for pair in coords or []:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            lon = float(pair[0])
+            lat = float(pair[1])
+        except (TypeError, ValueError):
+            continue
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            continue
+        lonlats.append((lon, lat))
+        pts.append(to_2193.transform(lon, lat))
+    return lonlats, pts
+
+
+def _segment_unit_2193(pts, reverse=False):
+    """Unit vector of the first (or last) non-zero NZTM segment."""
+    if reverse:
+        indices = range(len(pts) - 2, -1, -1)
+    else:
+        indices = range(len(pts) - 1)
+    for index in indices:
+        dx = pts[index + 1][0] - pts[index][0]
+        dy = pts[index + 1][1] - pts[index][1]
+        if math.hypot(dx, dy) >= 1e-6:
+            return _unit_vector(dx, dy)
+    return None
+
+
+def extend_centerline_ends(coords, extra_m=CENTERLINE_END_BUFFER_M):
+    """Return centreline vertices with extra_m beyond the first and last points.
+
+    The first drawn point is treated as upstream and is extended against the
+    first NZTM segment. The last point is downstream and is extended along the
+    last segment. Extensions follow the channel, not the map axes.
+    """
+    extra_m = float(extra_m) if extra_m is not None else CENTERLINE_END_BUFFER_M
+    lonlats, pts = _centerline_pairs_2193(coords)
+    copied = [[lon, lat] for lon, lat in lonlats]
+    if extra_m <= 0 or len(pts) < 2:
+        return copied
+    start_unit = _segment_unit_2193(pts, reverse=False)
+    end_unit = _segment_unit_2193(pts, reverse=True)
+    if start_unit is None or end_unit is None:
+        return copied
+    x0, y0 = pts[0]
+    x1, y1 = pts[-1]
+    upstream = _lonlat_from_2193(x0 - start_unit[0] * extra_m, y0 - start_unit[1] * extra_m)
+    downstream = _lonlat_from_2193(x1 + end_unit[0] * extra_m, y1 + end_unit[1] * extra_m)
+    return [upstream] + copied + [downstream]
+
+
+def apply_centerline_end_buffers(
+    lat,
+    lon,
+    coords,
+    upstream_m=None,
+    downstream_m=None,
+    extra_m=CENTERLINE_END_BUFFER_M,
+    snap_m=None,
+):
+    """Extend the drawn centreline and grow along-channel AOI limits to cover it.
+
+    Returns (extended_coords, upstream_m, downstream_m). User extents are kept
+    when they already cover the buffered line; each side is capped at AOI_MAX_M.
+    Distances are measured from the same snapped NZTM origin used by bridge_aoi.
+    """
+    upstream_m = parse_aoi_extent(upstream_m, name="Upstream limit")
+    downstream_m = parse_aoi_extent(downstream_m, name="Downstream limit")
+    extended = extend_centerline_ends(coords, extra_m=extra_m)
+    if len(extended) < 2:
+        return extended, upstream_m, downstream_m
+    snap_m = DEM_CLIP_SNAP_M if snap_m is None else float(snap_m)
+    to_2193 = _transformer("EPSG:4326", "EPSG:2193")
+    origin_x, origin_y = to_2193.transform(float(lon), float(lat))
+    if snap_m > 0:
+        origin_x = round(origin_x / snap_m) * snap_m
+        origin_y = round(origin_y / snap_m) * snap_m
+    down_x, down_y = aoi_downstream_unit_2193(lat, lon, coords)
+    signed = []
+    for pair in extended:
+        px, py = to_2193.transform(float(pair[0]), float(pair[1]))
+        signed.append((px - origin_x) * down_x + (py - origin_y) * down_y)
+    if not signed:
+        return extended, upstream_m, downstream_m
+    # Keep the extra vertices inside the LiDAR crop (snap + 1 m cells).
+    pad_m = 2.0
+    need_up = max(0.0, -min(signed)) + pad_m
+    need_down = max(0.0, max(signed)) + pad_m
+    upstream_m = min(AOI_MAX_M, max(upstream_m, need_up))
+    downstream_m = min(AOI_MAX_M, max(downstream_m, need_down))
+    return extended, upstream_m, downstream_m
 
 
 def bridge_aoi(
@@ -2060,7 +2160,18 @@ def run_screening(
     cover_full_line = False
     if centerline_coords:
         logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
-        centerline = centerline_from_coords(centerline_coords)
+        extended_coords, upstream_m, downstream_m = apply_centerline_end_buffers(
+            lat,
+            lon,
+            centerline_coords,
+            upstream_m=upstream_m,
+            downstream_m=downstream_m,
+        )
+        logging.info(
+            "Extended centreline %.0f m upstream and downstream along the channel",
+            CENTERLINE_END_BUFFER_M,
+        )
+        centerline = centerline_from_coords(extended_coords)
         centerline_source = "drawn"
         cover_full_line = True
         along_m = projected_length_m(centerline)

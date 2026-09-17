@@ -257,6 +257,8 @@ let mode = "idle";
 let bridgeName = "";
 let pendingPin = null;
 let drawnLatLngs = [];
+let centerlineFinished = false;
+const CENTERLINE_END_BUFFER_M = 50;
 let drawingStroke = false;
 let demOverlay = null;
 let demOverlayUrl = null;
@@ -414,6 +416,69 @@ function lineLengthM(latlngs) {
     metres += map.distance(latlngs[i - 1], latlngs[i]);
   }
   return metres;
+}
+
+function latLngEastNorthUnit(from, to) {
+  const east = (to.lng - from.lng) * Math.cos((((from.lat + to.lat) / 2) * Math.PI) / 180);
+  const north = to.lat - from.lat;
+  const mag = Math.hypot(east, north);
+  if (mag < 1e-12) return null;
+  return { east: east / mag, north: north / mag };
+}
+
+function extendCentrelineLatLngs(latlngs, extraM) {
+  const extra = extraM == null ? CENTERLINE_END_BUFFER_M : extraM;
+  if (!latlngs || latlngs.length < 2 || extra <= 0) return (latlngs || []).slice();
+  let startUnit = null;
+  for (let i = 0; i < latlngs.length - 1; i += 1) {
+    startUnit = latLngEastNorthUnit(latlngs[i], latlngs[i + 1]);
+    if (startUnit) break;
+  }
+  let endUnit = null;
+  for (let i = latlngs.length - 2; i >= 0; i -= 1) {
+    endUnit = latLngEastNorthUnit(latlngs[i], latlngs[i + 1]);
+    if (endUnit) break;
+  }
+  if (!startUnit || !endUnit) return latlngs.slice();
+  const first = latlngs[0];
+  const last = latlngs[latlngs.length - 1];
+  const up = offsetLatLng(first, -startUnit.east * extra, -startUnit.north * extra);
+  const down = offsetLatLng(last, endUnit.east * extra, endUnit.north * extra);
+  return [up].concat(latlngs, [down]);
+}
+
+function displayCentrelineLatLngs() {
+  if (centerlineFinished && drawnLatLngs.length >= 2) {
+    return extendCentrelineLatLngs(drawnLatLngs);
+  }
+  return drawnLatLngs;
+}
+
+function signedAlongM(pin, down, ll) {
+  const east = (ll.lng - pin.lng) * 111320 * Math.cos((pin.lat * Math.PI) / 180);
+  const north = (ll.lat - pin.lat) * 111320;
+  return east * down.east + north * down.north;
+}
+
+function coverAoiForExtendedCentreline() {
+  if (!marker || drawnLatLngs.length < 2) return;
+  const pin = marker.getLatLng();
+  const down = aoiDownstreamUnit(pin);
+  const extended = extendCentrelineLatLngs(drawnLatLngs);
+  let minAlong = Infinity;
+  let maxAlong = -Infinity;
+  extended.forEach((ll) => {
+    const along = signedAlongM(pin, down, ll);
+    minAlong = Math.min(minAlong, along);
+    maxAlong = Math.max(maxAlong, along);
+  });
+  const pad = 20;
+  const clamp = (value) => Math.max(10, Math.min(5000, Math.ceil(value)));
+  const needUp = clamp(-minAlong + pad);
+  const needDown = clamp(maxAlong + pad);
+  const ext = aoiExtents();
+  if (runForm.upstream) runForm.upstream.value = String(Math.max(ext.upstream, needUp));
+  if (runForm.downstream) runForm.downstream.value = String(Math.max(ext.downstream, needDown));
 }
 
 function closeHelp() {
@@ -581,9 +646,13 @@ function refreshLegend() {
     items.push({ swatch: "bridge", label: `Bridge — ${bridgeName}` });
   }
   if (drawnLatLngs.length >= 2) {
+    const along = lineLengthM(displayCentrelineLatLngs());
+    const bufferNote = centerlineFinished
+      ? ` including ${CENTERLINE_END_BUFFER_M} m at each end`
+      : "";
     items.push({
       swatch: "river",
-      label: `River centreline — ${lineLengthM(drawnLatLngs).toFixed(0)} m analysis length`,
+      label: `River centreline — ${along.toFixed(0)} m analysis length${bufferNote}`,
     });
   } else if (drawnLatLngs.length === 1) {
     items.push({ swatch: "river", label: "River centreline (drawing…)" });
@@ -625,7 +694,8 @@ function refreshLegend() {
 }
 
 function updateLayoutPreview() {
-  const along = lineLengthM(drawnLatLngs);
+  const drawnAlong = lineLengthM(drawnLatLngs);
+  const along = lineLengthM(displayCentrelineLatLngs());
   const interval = Number(runForm.interval.value);
   const length = Number(runForm.length.value);
   const spacing = Number(runForm.sample_spacing.value);
@@ -672,7 +742,10 @@ function updateLayoutPreview() {
       extra = ` · run screening to add ${missing.map((item) => item.label).join(", ")}`;
     }
   }
-  layoutPreview.textContent = `${nTransects} transects along the drawn ${along.toFixed(0)} m · ${nSamples} DEM points each · ${ariNote}${extra}`;
+  const reachNote = centerlineFinished
+    ? `${along.toFixed(0)} m analysis reach (drawn ${drawnAlong.toFixed(0)} m plus ${CENTERLINE_END_BUFFER_M} m at each end)`
+    : `drawn ${along.toFixed(0)} m`;
+  layoutPreview.textContent = `${nTransects} transects along the ${reachNote} · ${nSamples} DEM points each · ${ariNote}${extra}`;
   const windowM = aoiWindowM();
   layoutPreview.textContent = `${layoutPreview.textContent} · DEM ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m`;
   updateAoiSize();
@@ -848,14 +921,17 @@ function centerlinePayload() {
 }
 
 function redrawDraft() {
-  draftLine.setLatLngs(drawnLatLngs);
-  draftLine.setStyle({ opacity: drawnLatLngs.length ? 0.95 : 0 });
+  const display = displayCentrelineLatLngs();
+  draftLine.setLatLngs(display);
+  draftLine.setStyle({ opacity: display.length ? 0.95 : 0 });
   vertexLayer.clearLayers();
-  drawnLatLngs.forEach((ll) => {
+  const extraEnds = centerlineFinished && display.length >= drawnLatLngs.length + 2;
+  display.forEach((ll, index) => {
+    const isBuffer = extraEnds && (index === 0 || index === display.length - 1);
     L.circleMarker(ll, {
-      radius: 5,
-      color: "#0f172a",
-      fillColor: "#7dd3fc",
+      radius: isBuffer ? 6 : 5,
+      color: isBuffer ? "#9a3412" : "#0f172a",
+      fillColor: isBuffer ? "#fb923c" : "#7dd3fc",
       fillOpacity: 1,
       weight: 2,
       interactive: false,
@@ -874,6 +950,7 @@ function addVertex(latlng) {
     return;
   }
   drawnLatLngs.push(L.latLng(latlng.lat, latlng.lng));
+  centerlineFinished = false;
   redrawDraft();
 }
 
@@ -886,9 +963,17 @@ function finishCentreline() {
   lastRun = null;
   selectedSection = null;
   overlay.clearLayers();
+  centerlineFinished = true;
+  coverAoiForExtendedCentreline();
+  aoiFromServer = null;
   setMode("params");
-  redrawAoi(aoiFromServer, { fit: true });
+  redrawDraft();
+  redrawAoi(null, { fit: true });
   scheduleDemPreview();
+  setStatus(
+    `Analysis includes ${CENTERLINE_END_BUFFER_M} m upstream and downstream of the drawn centreline, along the channel.`,
+    "ok"
+  );
 }
 
 function xsVertexStyle() {
@@ -1477,6 +1562,7 @@ function placeBridge(lat, lon, name) {
   lonInput.value = Number(lon).toFixed(6);
   bindMarker(lat, lon);
   drawnLatLngs = [];
+  centerlineFinished = false;
   ranTransects = false;
   overlay.clearLayers();
   redrawDraft();
@@ -1745,8 +1831,8 @@ function renderResults(payload, { scroll = true } = {}) {
   if (resultsBlocks) resultsBlocks.innerHTML = "";
   plotsEl.innerHTML = "";
   const lengthNote = payload.layout?.along_m != null
-    ? `Transects cover the ${Number(payload.layout.along_m).toFixed(0)} m centreline you drew.`
-    : "Transects follow the river centreline you drew.";
+    ? `Transects cover the ${Number(payload.layout.along_m).toFixed(0)} m analysis reach (drawn centreline plus 50 m at each end).`
+    : "Transects follow the river centreline you drew, plus 50 m at each end.";
   const scenarios = visibleScenarios(payload);
   resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Each orange numbered dot on the long section is a transect station. Each block is one transect; return periods sit side by side in the plot colours so flow, water level, velocity, and status can be compared. Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
   if (payload.layout) {
@@ -1899,6 +1985,8 @@ modeDrawBtn.addEventListener("click", (event) => {
   event.stopPropagation();
   ranTransects = false;
   overlay.clearLayers();
+  centerlineFinished = false;
+  redrawDraft();
   setMode("draw");
 });
 
@@ -1910,11 +1998,13 @@ modeXsBtn.addEventListener("click", (event) => {
 
 undoBtn.addEventListener("click", () => {
   drawnLatLngs.pop();
+  centerlineFinished = false;
   redrawDraft();
 });
 
 clearBtn.addEventListener("click", () => {
   drawnLatLngs = [];
+  centerlineFinished = false;
   ranTransects = false;
   overlay.clearLayers();
   aoiFromServer = null;
