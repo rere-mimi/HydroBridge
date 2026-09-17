@@ -1294,6 +1294,126 @@ def manning_discharge(area, radius, mannings_n, slope):
     return float(velocity), float(velocity * area)
 
 
+ARI_YEARS = (10, 25, 50, 100, 1000)
+ARI_COLORS = {
+    10: "#0284c7",
+    25: "#059669",
+    50: "#d97706",
+    100: "#7c3aed",
+    1000: "#be123c",
+}
+ARI_STAT_KEYS = (
+    "water_level_m",
+    "max_depth_m",
+    "width_m",
+    "area_m2",
+    "depth_mean_m",
+    "wetted_perimeter_m",
+    "hydraulic_radius_m",
+    "velocity_m_s",
+    "discharge_m3_s",
+    "target_discharge_m3_s",
+    "conveys",
+    "overtopped",
+)
+
+
+def ari_key(years):
+    return f"{int(years)}y"
+
+
+def ari_label(years):
+    years = int(years)
+    return f"{years:,}-year ARI" if years >= 1000 else f"{years}-year ARI"
+
+
+def describe_flow_scenario(years, flow_m3_s):
+    years = int(years)
+    return {
+        "years": years,
+        "key": ari_key(years),
+        "label": ari_label(years),
+        "flow_m3_s": float(flow_m3_s),
+        "color": ARI_COLORS[years],
+    }
+
+
+def normalize_flow_scenarios(flow_m3_s=10.0, scenarios=None):
+    """Return ordered unique ARI design-flow scenarios.
+
+    When *scenarios* is omitted, a single 100-year ARI uses *flow_m3_s* so the
+    CLI and older callers keep working. An explicit empty list is an error.
+    """
+    if flow_m3_s is None:
+        flow_m3_s = 10.0
+    try:
+        fallback = float(flow_m3_s)
+    except (TypeError, ValueError) as exc:
+        raise HydroScreenError("Flow rate must be a number.") from exc
+    if fallback < 0:
+        raise HydroScreenError("Flow rate cannot be negative.")
+
+    if scenarios is None:
+        return [describe_flow_scenario(100, fallback)]
+
+    if isinstance(scenarios, dict):
+        raw_items = [{"years": key, "flow_m3_s": value} for key, value in scenarios.items()]
+    else:
+        try:
+            raw_items = list(scenarios)
+        except TypeError as exc:
+            raise HydroScreenError("Return periods must be a list of year and flow pairs.") from exc
+
+    items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise HydroScreenError("Each return period needs a year and a flow rate.")
+        years = item.get("years", item.get("ari", item.get("year")))
+        quantity = item.get("flow_m3_s", item.get("flow", item.get("q")))
+        if years is None:
+            raise HydroScreenError("Each return period needs a year and a flow rate.")
+        try:
+            years = int(years)
+        except (TypeError, ValueError) as exc:
+            raise HydroScreenError("Return period years must be a number.") from exc
+        if years not in ARI_YEARS:
+            allowed = ", ".join(str(year) for year in ARI_YEARS)
+            raise HydroScreenError(f"Unsupported return period {years}. Choose from {allowed}.")
+        if quantity is None:
+            quantity = fallback
+        try:
+            quantity = float(quantity)
+        except (TypeError, ValueError) as exc:
+            raise HydroScreenError("Flow rate must be a number.") from exc
+        if quantity < 0:
+            raise HydroScreenError("Flow rate cannot be negative.")
+        items.append(describe_flow_scenario(years, quantity))
+
+    if not items:
+        raise HydroScreenError("Select at least one return period.")
+
+    seen = set()
+    ordered = []
+    for item in items:
+        if item["key"] in seen:
+            raise HydroScreenError(f"{item['label']} is selected more than once.")
+        seen.add(item["key"])
+        ordered.append(item)
+    return ordered
+
+
+def _ari_hydraulics(stats, scenario):
+    slim = {key: stats.get(key) for key in ARI_STAT_KEYS}
+    slim.update({
+        "years": scenario["years"],
+        "key": scenario["key"],
+        "label": scenario["label"],
+        "color": scenario["color"],
+        "flow_m3_s": scenario["flow_m3_s"],
+    })
+    return slim
+
+
 def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, cancel_event=None):
     """Raise water level along the transect until Manning Q matches the specified flow."""
     finite = elevs[np.isfinite(elevs)]
@@ -1371,26 +1491,27 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, c
 
 def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0, src=None):
     """Bed slope along the river centreline from DEM samples, as |dz/ds|."""
-    slope, _dists, _elevs = centerline_slope_and_profile(
+    slope, _dists, _elevs, _signed, _intercept = centerline_slope_and_profile(
         dem_path, centerline, spacing_m=spacing_m, src=src
     )
     return slope
 
 
 def centerline_slope_and_profile(dem_path, centerline, spacing_m=10.0, src=None):
-    """Return (|dz/ds|, distances_m, elevations) along the centreline."""
+    """Return (|dz/ds|, distances_m, elevations, signed slope, intercept)."""
     dists, elevs, _coords = sample_dem_along_line(
         dem_path, centerline, spacing_m=spacing_m, src=src
     )
     mask = np.isfinite(elevs)
     if mask.sum() < 2:
-        return None, dists, elevs
+        return None, dists, elevs, None, None
     distance = dists[mask]
     elevation = elevs[mask]
     if float(distance[-1] - distance[0]) < 1.0:
-        return None, dists, elevs
-    slope, _intercept = np.polyfit(distance.astype(float), elevation.astype(float), 1)
-    return max(abs(float(slope)), 1e-6), dists, elevs
+        return None, dists, elevs, None, None
+    signed, intercept = np.polyfit(distance.astype(float), elevation.astype(float), 1)
+    abs_slope = max(abs(float(signed)), 1e-6)
+    return abs_slope, dists, elevs, float(signed), float(intercept)
 
 
 def centerline_bridge_station_m(centerline, lon, lat):
@@ -1410,8 +1531,11 @@ def _profile_json(dists, elevs):
     }
 
 
-def plot_cross_section(dists, elevs, out_png, water_level=None):
+def plot_cross_section(dists, elevs, out_png, water_level=None, water_levels=None):
     global _PLOT_FIG, _PLOT_AX
+    levels = list(water_levels or [])
+    if not levels and water_level is not None and np.isfinite(water_level):
+        levels = [{"water_level_m": water_level, "color": "#1f6f8b", "label": "Water level"}]
     with _PLOT_LOCK:
         if _PLOT_FIG is None or _PLOT_AX is None:
             _PLOT_FIG, _PLOT_AX = plt.subplots(figsize=(7.2, 3.4), dpi=90)
@@ -1420,10 +1544,18 @@ def plot_cross_section(dists, elevs, out_png, water_level=None):
         ax.plot(dists, elevs, "-k", label="Ground")
         finite = elevs[np.isfinite(elevs)]
         y_floor = (np.min(finite) - 1) if len(finite) else -1
-        if water_level is not None and np.isfinite(water_level):
-            wet = np.isfinite(elevs) & (elevs < water_level)
-            ax.fill_between(dists, elevs, water_level, where=wet, color="#4ea3c9", alpha=0.55, interpolate=True)
-            ax.axhline(water_level, color="#1f6f8b", linestyle="--", linewidth=1.2, label="Water level")
+        if levels:
+            fill_one = len(levels) == 1
+            for item in levels:
+                level = item.get("water_level_m")
+                if level is None or not np.isfinite(level):
+                    continue
+                color = item.get("color") or "#1f6f8b"
+                label = item.get("label") or "Water level"
+                if fill_one:
+                    wet = np.isfinite(elevs) & (elevs < level)
+                    ax.fill_between(dists, elevs, level, where=wet, color=color, alpha=0.35, interpolate=True)
+                ax.axhline(level, color=color, linestyle="--", linewidth=1.2, label=label)
             ax.legend(loc="best", frameon=False)
         else:
             ax.fill_between(dists, elevs, y_floor, color="lightblue")
@@ -1495,6 +1627,7 @@ def run_screening(
     length=200.0,
     mannings_n=0.035,
     flow_m3_s=10.0,
+    flow_scenarios=None,
     along_m=None,
     sample_spacing=1.0,
     centerline_coords=None,
@@ -1509,8 +1642,8 @@ def run_screening(
         along_m = 2.0 * n_each_side * interval
     if mannings_n <= 0:
         raise HydroScreenError("Manning's n must be greater than 0.")
-    if flow_m3_s < 0:
-        raise HydroScreenError("Flow rate cannot be negative.")
+    scenarios = normalize_flow_scenarios(flow_m3_s, flow_scenarios)
+    primary_flow = scenarios[0]["flow_m3_s"]
 
     cover_full_line = False
     if centerline_coords:
@@ -1644,11 +1777,12 @@ def run_screening(
     check_cancelled(cancel_event)
 
     summary = []
+    excel_rows = []
     data_rows = []
     transect_features = []
     point_id = 1
     with rasterio.open(dem_path) as dem_src:
-        slope, cl_dists, cl_elevs = centerline_slope_and_profile(
+        slope, cl_dists, cl_elevs, fit_slope, fit_intercept = centerline_slope_and_profile(
             dem_path, reach, spacing_m=max(sample_spacing, 5.0), src=dem_src
         )
         if slope is None:
@@ -1661,20 +1795,36 @@ def run_screening(
         cl_json = _profile_json(cl_dists, cl_elevs)
         cl_json["origin_m"] = float(origin_m)
         cl_json["length_m"] = float(cl_dists[-1]) if len(cl_dists) else float(line_len_m)
+        cl_json["slope"] = float(slope)
+        cl_json["fit_slope"] = float(fit_slope) if fit_slope is not None else None
+        cl_json["fit_intercept"] = float(fit_intercept) if fit_intercept is not None else None
 
         for i, (tran, offset) in enumerate(transects):
             check_cancelled(cancel_event)
             dists, elevs, sample_coords = sample_dem_along_line(
                 dem_path, tran, spacing_m=sample_spacing, src=dem_src
             )
-            stats = solve_water_level(
-                dists,
-                elevs,
-                flow_m3_s=flow_m3_s,
-                mannings_n=mannings_n,
-                slope=slope,
-                cancel_event=cancel_event,
-            )
+            aris = {}
+            plot_levels = []
+            primary_stats = None
+            for scenario in scenarios:
+                stats = solve_water_level(
+                    dists,
+                    elevs,
+                    flow_m3_s=scenario["flow_m3_s"],
+                    mannings_n=mannings_n,
+                    slope=slope,
+                    cancel_event=cancel_event,
+                )
+                slim = _ari_hydraulics(stats, scenario)
+                aris[scenario["key"]] = slim
+                plot_levels.append({
+                    "water_level_m": stats.get("water_level_m"),
+                    "color": scenario["color"],
+                    "label": scenario["label"],
+                })
+                if primary_stats is None:
+                    primary_stats = stats
             df = pd.DataFrame({
                 "distance_m": dists,
                 "longitude": [xy[0] for xy in sample_coords],
@@ -1684,7 +1834,14 @@ def run_screening(
             csv_path = outdir / f"transect_{i+1}.csv"
             df.to_csv(csv_path, index=False)
             png_path = outdir / f"transect_{i+1}.png"
-            plot_cross_section(dists, elevs, png_path, water_level=stats.get("water_level_m"))
+            plot_cross_section(
+                dists,
+                elevs,
+                png_path,
+                water_level=primary_stats.get("water_level_m"),
+                water_levels=plot_levels,
+            )
+            stats = dict(primary_stats)
             stats.update({
                 "transect": i + 1,
                 "offset_m": float(offset),
@@ -1692,8 +1849,16 @@ def run_screening(
                 "sample_spacing_m": float(sample_spacing),
                 "csv": str(csv_path),
                 "plot": str(png_path),
+                "aris": aris,
             })
             summary.append(stats)
+            excel_row = {key: value for key, value in stats.items() if key != "aris"}
+            if len(scenarios) > 1:
+                for key, slim in aris.items():
+                    excel_row[f"{key}_water_level_m"] = slim.get("water_level_m")
+                    excel_row[f"{key}_velocity_m_s"] = slim.get("velocity_m_s")
+                    excel_row[f"{key}_discharge_m3_s"] = slim.get("discharge_m3_s")
+            excel_rows.append(excel_row)
             for dist, elev in zip(dists, elevs):
                 data_rows.append({
                     "ID": point_id,
@@ -1720,14 +1885,16 @@ def run_screening(
                 "n_samples": int(len(dists)),
                 "distance_m": profile["distance_m"],
                 "elevation_m": profile["elevation_m"],
-                "water_level_m": stats.get("water_level_m"),
+                "water_level_m": primary_stats.get("water_level_m"),
+                "velocity_m_s": primary_stats.get("velocity_m_s"),
+                "aris": aris,
                 "csv": csv_path.name,
                 "plot": png_path.name,
             })
 
     check_cancelled(cancel_event)
     summary_path = outdir / "summary.xlsx"
-    write_screening_workbook(summary_path, summary, data_rows)
+    write_screening_workbook(summary_path, excel_rows, data_rows)
     logging.info("Wrote summary workbook to %s (%d sample points)", summary_path, len(data_rows))
 
     if temp_dir:
@@ -1751,9 +1918,12 @@ def run_screening(
             "transect_length_m": float(length),
             "sample_spacing_m": float(sample_spacing),
             "n_transects": len(transects),
-            "flow_m3_s": float(flow_m3_s),
+            "flow_m3_s": float(primary_flow),
+            "flow_scenarios": scenarios,
             "mannings_n": float(mannings_n),
             "slope": float(slope),
+            "fit_slope": float(fit_slope) if fit_slope is not None else None,
+            "fit_intercept": float(fit_intercept) if fit_intercept is not None else None,
             "dem_source": dem_source_used,
             "dem_layer": LINZ_LIDAR_1M_LAYER if dem_source_used == "linz-lidar-1m" else None,
             "dem_buffer_m": float(buffer_m),

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HydroBridge</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=select-section">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=ari-flow">
 </head>
 <body>
   <div class="app-frame">
@@ -134,19 +134,60 @@
       </span>
     </label>
 
-    <label class="field">
-      <span class="field-label">
-        Flow rate Q
-        <button type="button" class="help" aria-label="What is flow rate?" data-help="help-flow">?</button>
+    <fieldset class="field ari-field">
+      <legend class="field-label">
+        Return period (ARI)
+        <button type="button" class="help" aria-label="What is a return period?" data-help="help-ari">?</button>
+      </legend>
+      <span id="help-ari" class="help-pop" role="tooltip" hidden>
+        Annual Recurrence Interval. Select one or more design floods and enter the flow for each. Water level and velocity for every selected ARI overlay on the same profile, with the centreline slope shown on the long section.
       </span>
-      <span class="unit-field">
-        <input name="flow" type="number" step="0.1" min="0" value="10">
-        <span>m³/s</span>
-      </span>
-      <span id="help-flow" class="help-pop" role="tooltip" hidden>
-        Design discharge to convey. Water level is raised on each transect until Manning’s equation matches this flow.
-      </span>
-    </label>
+      <p class="muted">Select one or more intervals. Enter Q for each selected ARI. Profiles overlay on the same plot.</p>
+      <div class="ari-list" id="ari-list">
+        <label class="ari-row">
+          <input type="checkbox" data-ari="10" aria-label="10-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#0284c7"></i> 10-year</span>
+          <span class="unit-field">
+            <input name="flow_10" type="number" step="0.1" min="0" value="5" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="25" aria-label="25-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#059669"></i> 25-year</span>
+          <span class="unit-field">
+            <input name="flow_25" type="number" step="0.1" min="0" value="7" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="50" aria-label="50-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#d97706"></i> 50-year</span>
+          <span class="unit-field">
+            <input name="flow_50" type="number" step="0.1" min="0" value="8.5" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="100" checked aria-label="100-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#7c3aed"></i> 100-year</span>
+          <span class="unit-field">
+            <input name="flow_100" type="number" step="0.1" min="0" value="10">
+            <span>m³/s</span>
+          </span>
+        </label>
+        <label class="ari-row">
+          <input type="checkbox" data-ari="1000" aria-label="1,000-year ARI">
+          <span class="ari-name"><i class="ari-swatch" style="background:#be123c"></i> 1,000-year</span>
+          <span class="unit-field">
+            <input name="flow_1000" type="number" step="0.1" min="0" value="22" disabled>
+            <span>m³/s</span>
+          </span>
+        </label>
+      </div>
+      <input type="hidden" name="aris" id="aris-json" value="">
+      <input type="hidden" name="flow" id="flow-primary" value="10">
+    </fieldset>
 
     <label class="field">
       <span class="field-label">
@@ -241,6 +282,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=select-section"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=ari-flow"></script>
 </body>
 </html>

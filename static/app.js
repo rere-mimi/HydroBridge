@@ -47,6 +47,96 @@ const legendEl = document.getElementById("legend");
 const demOpacityControl = document.getElementById("dem-opacity-control");
 const demOpacityInput = document.getElementById("dem-opacity");
 const demOpacityValue = document.getElementById("dem-opacity-value");
+const arisJson = document.getElementById("aris-json");
+const flowPrimary = document.getElementById("flow-primary");
+
+const ARI_YEARS = [10, 25, 50, 100, 1000];
+const ARI_COLORS = {
+  10: "#0284c7",
+  25: "#059669",
+  50: "#d97706",
+  100: "#7c3aed",
+  1000: "#be123c",
+};
+const ARI_DEFAULT_Q = { 10: 5, 25: 7, 50: 8.5, 100: 10, 1000: 22 };
+
+function ariLabel(years) {
+  const n = Number(years);
+  return n >= 1000 ? "1,000-year ARI" : `${n}-year ARI`;
+}
+
+function selectedAris() {
+  if (!runForm) return [];
+  return ARI_YEARS.filter((year) => {
+    const box = runForm.querySelector(`input[data-ari="${year}"]`);
+    return box && box.checked;
+  }).map((year) => {
+    const input = runForm.querySelector(`[name="flow_${year}"]`);
+    return {
+      years: year,
+      key: `${year}y`,
+      label: ariLabel(year),
+      flow_m3_s: Number(input && input.value),
+      color: ARI_COLORS[year],
+    };
+  });
+}
+
+function syncAriInputs() {
+  if (!runForm) return selectedAris();
+  ARI_YEARS.forEach((year) => {
+    const box = runForm.querySelector(`input[data-ari="${year}"]`);
+    const input = runForm.querySelector(`[name="flow_${year}"]`);
+    if (!box || !input) return;
+    input.disabled = !box.checked;
+    if (box.checked && (input.value === "" || !Number.isFinite(Number(input.value)))) {
+      input.value = String(ARI_DEFAULT_Q[year]);
+    }
+  });
+  const selected = selectedAris();
+  if (arisJson) {
+    arisJson.value = JSON.stringify(
+      selected.map((item) => ({ years: item.years, flow_m3_s: item.flow_m3_s }))
+    );
+  }
+  if (flowPrimary) {
+    flowPrimary.value = selected.length ? String(selected[0].flow_m3_s) : "10";
+  }
+  return selected;
+}
+
+function computedScenarios(payload) {
+  const src = payload || lastRun;
+  return (src && src.layout && Array.isArray(src.layout.flow_scenarios) && src.layout.flow_scenarios) || [];
+}
+
+function visibleScenarios(payload) {
+  const computed = computedScenarios(payload);
+  const selected = selectedAris();
+  if (!computed.length) return selected;
+  const byYear = new Map(computed.map((item) => [Number(item.years), item]));
+  return selected.map((item) => byYear.get(item.years)).filter(Boolean);
+}
+
+function formatSlope(absSlope) {
+  const value = Number(absSlope);
+  if (!Number.isFinite(value) || value <= 0) return "—";
+  const ratio = value >= 1e-9 ? Math.round(1 / value) : null;
+  const sci = value.toExponential(2);
+  return ratio ? `${sci} (1 in ${ratio})` : sci;
+}
+
+function hydFor(record, key) {
+  if (record && record.aris && key && record.aris[key]) return record.aris[key];
+  return record || {};
+}
+
+function refreshAriPlot() {
+  syncAriInputs();
+  if (!lastRun || !selectedSection) return;
+  renderResults(lastRun, { scroll: false });
+  showSelectedProfile();
+}
 
 const map = L.map("map", { doubleClickZoom: false }).setView(
   [CHRISTCHURCH.lat, CHRISTCHURCH.lon],
@@ -384,7 +474,31 @@ function updateLayoutPreview() {
   }
   const nTransects = Math.floor(along / interval + 1e-9) + 1;
   const nSamples = Math.min(2001, Math.floor(length / spacing) + 1);
-  layoutPreview.textContent = `${nTransects} transects along the drawn ${along.toFixed(0)} m · ${nSamples} DEM points each`;
+  const aris = syncAriInputs();
+  if (!aris.length) {
+    layoutPreview.textContent = "Select at least one return period (ARI).";
+    runReady = false;
+    runBlockReason = "Select at least one return period and enter its flow.";
+    setRunAvailability();
+    return;
+  }
+  if (aris.some((item) => !Number.isFinite(item.flow_m3_s) || item.flow_m3_s < 0)) {
+    layoutPreview.textContent = "Enter a flow rate ≥ 0 for each selected ARI.";
+    runReady = false;
+    runBlockReason = "Enter a flow rate for each selected return period.";
+    setRunAvailability();
+    return;
+  }
+  const ariNote = aris.map((item) => item.label.replace(" ARI", "")).join(", ");
+  let extra = "";
+  if (lastRun) {
+    const computed = new Set(computedScenarios(lastRun).map((item) => Number(item.years)));
+    const missing = aris.filter((item) => !computed.has(item.years));
+    if (missing.length) {
+      extra = ` · run screening to add ${missing.map((item) => item.label).join(", ")}`;
+    }
+  }
+  layoutPreview.textContent = `${nTransects} transects along the drawn ${along.toFixed(0)} m · ${nSamples} DEM points each · ${ariNote}${extra}`;
   runReady = Boolean(marker);
   runBlockReason = marker
     ? ""
@@ -615,10 +729,48 @@ function clearXsChart() {
   ctx.clearRect(0, 0, width, height);
 }
 
+function strokePolyline(ctx, pts) {
+  let drawing = false;
+  pts.forEach((pt) => {
+    if (!pt) {
+      drawing = false;
+      return;
+    }
+    if (!drawing) {
+      ctx.moveTo(pt[0], pt[1]);
+      drawing = true;
+    } else {
+      ctx.lineTo(pt[0], pt[1]);
+    }
+  });
+}
+
 function drawXsProfile(profile, options = {}) {
   if (!xsCanvas || !profile) return;
   const dists = profile.distance_m || [];
   const elevs = profile.elevation_m || [];
+  const waterLevels = [];
+  if (Array.isArray(options.waterLevels)) {
+    options.waterLevels.forEach((item) => {
+      if (item && item.value != null && Number.isFinite(Number(item.value))) {
+        waterLevels.push(item);
+      }
+    });
+  } else if (options.waterLevel != null && Number.isFinite(Number(options.waterLevel))) {
+    waterLevels.push({
+      value: Number(options.waterLevel),
+      color: "#1f6f8b",
+      label: "Water level",
+      velocity: options.velocity,
+    });
+  }
+  const series = Array.isArray(options.series) ? options.series.filter(Boolean) : [];
+  const slope = options.slope && Number.isFinite(Number(options.slope.abs)) ? options.slope : null;
+  const seriesHasVelocity = series.some((item) =>
+    (item.points || []).some((pt) => pt.velocity_m_s != null && Number.isFinite(Number(pt.velocity_m_s)))
+  );
+  const hasVelocity = seriesHasVelocity || waterLevels.some((item) => item.velocity != null && Number.isFinite(Number(item.velocity)));
+
   const dpr = window.devicePixelRatio || 1;
   const cssW = Math.max(xsCanvas.clientWidth || 640, 320);
   const cssH = Math.max(xsCanvas.clientHeight || 200, 160);
@@ -630,7 +782,13 @@ function drawXsProfile(profile, options = {}) {
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, cssW, cssH);
 
-  const pad = { left: 52, right: 16, top: 14, bottom: 32 };
+  const legendCount = 1 + (slope ? 1 : 0) + Math.max(waterLevels.length, series.length);
+  const pad = {
+    left: 52,
+    right: hasVelocity ? 54 : 18,
+    top: Math.max(16, 10 + Math.min(legendCount, 6) * 13),
+    bottom: 32,
+  };
   const plotW = cssW - pad.left - pad.right;
   const plotH = cssH - pad.top - pad.bottom;
   const xmax = dists.length ? Number(dists[dists.length - 1]) : 1;
@@ -643,18 +801,48 @@ function drawXsProfile(profile, options = {}) {
   }
   let zmin = Math.min(...finite);
   let zmax = Math.max(...finite);
-  if (zmax <= zmin) zmax = zmin + 1;
-  const water = options.waterLevel;
-  if (water != null && Number.isFinite(Number(water))) {
-    zmin = Math.min(zmin, Number(water));
-    zmax = Math.max(zmax, Number(water));
+  waterLevels.forEach((item) => {
+    zmin = Math.min(zmin, Number(item.value));
+    zmax = Math.max(zmax, Number(item.value));
+  });
+  series.forEach((item) => {
+    (item.points || []).forEach((pt) => {
+      if (pt.water_level_m != null && Number.isFinite(Number(pt.water_level_m))) {
+        zmin = Math.min(zmin, Number(pt.water_level_m));
+        zmax = Math.max(zmax, Number(pt.water_level_m));
+      }
+    });
+  });
+  if (slope && Number.isFinite(Number(slope.signed)) && Number.isFinite(Number(slope.intercept))) {
+    const z0 = Number(slope.intercept);
+    const z1 = Number(slope.intercept) + Number(slope.signed) * xmax;
+    zmin = Math.min(zmin, z0, z1);
+    zmax = Math.max(zmax, z0, z1);
   }
+  if (zmax <= zmin) zmax = zmin + 1;
   const zPad = (zmax - zmin) * 0.08;
   zmin -= zPad;
   zmax += zPad;
 
+  let vmin = 0;
+  let vmax = 0;
+  series.forEach((item) => {
+    (item.points || []).forEach((pt) => {
+      if (pt.velocity_m_s != null && Number.isFinite(Number(pt.velocity_m_s))) {
+        vmax = Math.max(vmax, Number(pt.velocity_m_s));
+      }
+    });
+  });
+  waterLevels.forEach((item) => {
+    if (item.velocity != null && Number.isFinite(Number(item.velocity))) {
+      vmax = Math.max(vmax, Number(item.velocity));
+    }
+  });
+  if (vmax <= vmin) vmax = 1;
+
   const xOf = (d) => pad.left + (Number(d) / Math.max(xmax, 1e-6)) * plotW;
   const yOf = (z) => pad.top + (1 - (Number(z) - zmin) / (zmax - zmin)) * plotH;
+  const vOf = (v) => pad.top + (1 - (Number(v) - vmin) / Math.max(vmax - vmin, 1e-6)) * plotH;
 
   ctx.strokeStyle = "#e2e8f0";
   ctx.lineWidth = 1;
@@ -662,16 +850,29 @@ function drawXsProfile(profile, options = {}) {
   ctx.moveTo(pad.left, pad.top);
   ctx.lineTo(pad.left, pad.top + plotH);
   ctx.lineTo(pad.left + plotW, pad.top + plotH);
+  if (hasVelocity) {
+    ctx.moveTo(pad.left + plotW, pad.top);
+    ctx.lineTo(pad.left + plotW, pad.top + plotH);
+  }
   ctx.stroke();
 
   ctx.fillStyle = "#64748b";
   ctx.font = "11px Segoe UI, system-ui, sans-serif";
-  ctx.fillText(options.xLabel || "Distance (m)", pad.left + plotW / 2 - 32, cssH - 8);
+  ctx.fillText(options.xLabel || "Distance (m)", pad.left + plotW / 2 - 36, cssH - 8);
   ctx.save();
   ctx.translate(14, pad.top + plotH / 2);
   ctx.rotate(-Math.PI / 2);
   ctx.fillText("Elevation (m)", -40, 0);
   ctx.restore();
+  if (hasVelocity) {
+    ctx.save();
+    ctx.translate(cssW - 12, pad.top + plotH / 2);
+    ctx.rotate(Math.PI / 2);
+    ctx.fillText("Velocity (m/s)", -42, 0);
+    ctx.restore();
+    ctx.fillText(vmin.toFixed(1), pad.left + plotW + 6, vOf(vmin) + 3);
+    ctx.fillText(vmax.toFixed(1), pad.left + plotW + 6, vOf(vmax) + 3);
+  }
   ctx.fillText(zmin.toFixed(1), 6, yOf(zmin) + 3);
   ctx.fillText(zmax.toFixed(1), 6, yOf(zmax) + 3);
   ctx.fillText("0", xOf(0) - 3, pad.top + plotH + 16);
@@ -688,61 +889,144 @@ function drawXsProfile(profile, options = {}) {
   });
 
   ctx.beginPath();
-  let drawing = false;
-  points.forEach((pt) => {
-    if (!pt) {
-      drawing = false;
-      return;
-    }
-    if (!drawing) {
-      ctx.moveTo(pt[0], pt[1]);
-      drawing = true;
-    } else {
-      ctx.lineTo(pt[0], pt[1]);
-    }
-  });
+  strokePolyline(ctx, points);
   const first = points.find((pt) => pt);
   const last = [...points].reverse().find((pt) => pt);
   if (first && last) {
     ctx.lineTo(last[0], pad.top + plotH);
     ctx.lineTo(first[0], pad.top + plotH);
     ctx.closePath();
-    ctx.fillStyle = "rgba(2, 132, 199, 0.22)";
+    ctx.fillStyle = "rgba(148, 163, 184, 0.28)";
     ctx.fill();
   }
 
   ctx.beginPath();
-  drawing = false;
-  points.forEach((pt) => {
-    if (!pt) {
-      drawing = false;
-      return;
-    }
-    if (!drawing) {
-      ctx.moveTo(pt[0], pt[1]);
-      drawing = true;
-    } else {
-      ctx.lineTo(pt[0], pt[1]);
-    }
-  });
+  strokePolyline(ctx, points);
   ctx.strokeStyle = "#0f172a";
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  if (water != null && Number.isFinite(Number(water))) {
-    const y = yOf(Number(water));
+  if (slope && Number.isFinite(Number(slope.signed)) && Number.isFinite(Number(slope.intercept))) {
+    const z0 = Number(slope.intercept);
+    const z1 = Number(slope.intercept) + Number(slope.signed) * xmax;
+    ctx.beginPath();
+    ctx.moveTo(xOf(0), yOf(z0));
+    ctx.lineTo(xOf(xmax), yOf(z1));
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "#92400e";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (waterLevels.length === 1) {
+    const level = Number(waterLevels[0].value);
+    ctx.beginPath();
+    let drawing = false;
+    let started = false;
+    dists.forEach((dist, i) => {
+      const z = elevs[i];
+      if (z == null || !Number.isFinite(Number(z)) || Number(z) >= level) {
+        drawing = false;
+        return;
+      }
+      const x = xOf(dist);
+      const yGround = yOf(Number(z));
+      const yWater = yOf(level);
+      if (!drawing) {
+        if (!started) ctx.moveTo(x, yGround);
+        else ctx.lineTo(x, yGround);
+        ctx.lineTo(x, yWater);
+        drawing = true;
+        started = true;
+      } else {
+        ctx.lineTo(x, yWater);
+      }
+    });
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = waterLevels[0].color || "#0284c7";
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  waterLevels.forEach((item) => {
+    const y = yOf(Number(item.value));
     ctx.beginPath();
     ctx.moveTo(pad.left, y);
     ctx.lineTo(pad.left + plotW, y);
     ctx.setLineDash([6, 4]);
-    ctx.strokeStyle = "#1f6f8b";
-    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = item.color || "#1f6f8b";
+    ctx.lineWidth = 1.6;
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "#1f6f8b";
-    ctx.font = "11px Segoe UI, system-ui, sans-serif";
-    ctx.fillText(`WL ${Number(water).toFixed(2)} m`, pad.left + 6, Math.max(pad.top + 12, y - 6));
-  }
+  });
+
+  series.forEach((item) => {
+    const wlPts = (item.points || [])
+      .filter((pt) => pt.water_level_m != null && Number.isFinite(Number(pt.water_level_m)))
+      .map((pt) => [xOf(pt.distance_m), yOf(pt.water_level_m)]);
+    if (wlPts.length) {
+      ctx.beginPath();
+      strokePolyline(ctx, wlPts);
+      ctx.strokeStyle = item.color || "#0284c7";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    if (hasVelocity) {
+      const vPts = (item.points || [])
+        .filter((pt) => pt.velocity_m_s != null && Number.isFinite(Number(pt.velocity_m_s)))
+        .map((pt) => [xOf(pt.distance_m), vOf(pt.velocity_m_s)]);
+      if (vPts.length) {
+        ctx.beginPath();
+        strokePolyline(ctx, vPts);
+        ctx.setLineDash([2, 4]);
+        ctx.strokeStyle = item.color || "#0284c7";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+  });
+
+  const legend = [];
+  legend.push({ color: "#0f172a", text: "Ground", dash: [] });
+  if (slope) legend.push({ color: "#92400e", text: `Slope S = ${formatSlope(slope.abs)}`, dash: [4, 4] });
+  waterLevels.forEach((item) => {
+    const bits = [item.label || "Water level", `WL ${Number(item.value).toFixed(2)} m`];
+    if (item.velocity != null && Number.isFinite(Number(item.velocity))) {
+      bits.push(`V ${Number(item.velocity).toFixed(2)} m/s`);
+    }
+    if (item.flow != null && Number.isFinite(Number(item.flow))) {
+      bits.push(`Q ${Number(item.flow).toFixed(1)} m³/s`);
+    }
+    legend.push({ color: item.color || "#1f6f8b", text: bits.join(" · "), dash: [6, 4] });
+  });
+  series.forEach((item) => {
+    if (waterLevels.length) return;
+    const bits = [item.label || "ARI"];
+    if (item.flow != null && Number.isFinite(Number(item.flow))) bits.push(`Q ${Number(item.flow).toFixed(1)} m³/s`);
+    bits.push("WL solid");
+    bits.push("V dotted");
+    legend.push({ color: item.color || "#0284c7", text: bits.join(" · "), dash: [] });
+  });
+
+  legend.forEach((item, index) => {
+    const col = index > 2 ? 1 : 0;
+    const row = col ? index - 3 : index;
+    const x = pad.left + col * Math.max(220, plotW / 2);
+    const y = 10 + row * 12;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 16, y);
+    ctx.strokeStyle = item.color;
+    ctx.setLineDash(item.dash || []);
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#334155";
+    ctx.font = "10px Segoe UI, system-ui, sans-serif";
+    ctx.fillText(item.text, x + 20, y + 3);
+  });
 
   (options.stations || []).forEach((station) => {
     const dist = Number(station.distance_m);
@@ -778,7 +1062,6 @@ function drawXsProfile(profile, options = {}) {
     }
   });
 }
-
 function showXsViewer() {
   xsViewer.hidden = false;
   adaptMapLayout();
@@ -968,19 +1251,42 @@ function selectSection(next, { scroll = false } = {}) {
 
 function showSelectedProfile() {
   if (!lastRun || !selectedSection) return;
+  const scenarios = visibleScenarios(lastRun);
+  const slopeAbs = Number((lastRun.centerline_profile && lastRun.centerline_profile.slope) || (lastRun.layout && lastRun.layout.slope));
+  const slope = Number.isFinite(slopeAbs)
+    ? {
+        abs: slopeAbs,
+        signed: lastRun.centerline_profile && lastRun.centerline_profile.fit_slope,
+        intercept: lastRun.centerline_profile && lastRun.centerline_profile.fit_intercept,
+      }
+    : null;
   if (selectedSection.type === "transect") {
     const feat = (lastRun.transects || []).find((item) => item.transect === selectedSection.id);
     const row = (lastRun.summary || []).find((item) => item.transect === selectedSection.id);
     if (!feat || !feat.distance_m) return;
-    const water = feat.water_level_m != null ? feat.water_level_m : row && row.water_level_m;
+    const waterLevels = scenarios.map((scenario) => {
+      const hyd = hydFor(feat, scenario.key) && hydFor(feat, scenario.key).water_level_m != null
+        ? hydFor(feat, scenario.key)
+        : hydFor(row, scenario.key);
+      return {
+        value: hyd.water_level_m,
+        velocity: hyd.velocity_m_s,
+        color: scenario.color,
+        label: scenario.label,
+        flow: scenario.flow_m3_s,
+      };
+    }).filter((item) => item.value != null && Number.isFinite(Number(item.value)));
     xsProfile = {
       distance_m: feat.distance_m,
       elevation_m: feat.elevation_m,
-      options: { waterLevel: water },
+      options: { waterLevels },
     };
     if (xsTitle) xsTitle.textContent = `Transect ${feat.transect}`;
+    const ariNote = waterLevels.length
+      ? waterLevels.map((item) => `${item.label} WL ${fmt(item.value, 2)} m, V ${fmt(item.velocity, 2)} m/s`).join(" · ")
+      : "no ARI selected";
     setXsMeta(
-      `Offset ${fmt(feat.offset_m, 0)} m along the centreline · ${feat.n_samples || feat.distance_m.length} samples`
+      `Offset ${fmt(feat.offset_m, 0)} m along the centreline · ${feat.n_samples || feat.distance_m.length} samples · ${ariNote}`
     );
     showXsViewer();
     requestAnimationFrame(() => drawXsProfile(xsProfile, xsProfile.options));
@@ -995,17 +1301,36 @@ function showSelectedProfile() {
       label: String(tran.transect),
       selected: false,
     }));
+    const series = scenarios.map((scenario) => ({
+      color: scenario.color,
+      label: scenario.label,
+      flow: scenario.flow_m3_s,
+      points: (lastRun.transects || []).map((tran) => {
+        const hyd = hydFor(tran, scenario.key);
+        const station = tran.station_m != null ? Number(tran.station_m) : origin + Number(tran.offset_m || 0);
+        return {
+          distance_m: station,
+          water_level_m: hyd.water_level_m,
+          velocity_m_s: hyd.velocity_m_s,
+        };
+      }).sort((a, b) => a.distance_m - b.distance_m),
+    }));
     xsProfile = {
       distance_m: profile.distance_m,
       elevation_m: profile.elevation_m,
       options: {
         stations,
+        series,
+        slope,
         xLabel: "Distance along centreline (m)",
       },
     };
     if (xsTitle) xsTitle.textContent = "Centreline profile";
+    const ariNote = scenarios.length
+      ? scenarios.map((item) => item.label).join(", ")
+      : "bed only";
     setXsMeta(
-      `${stations.length} transect stations along the ${fmt(profile.length_m || profile.distance_m[profile.distance_m.length - 1], 0)} m river line`
+      `${stations.length} transect stations along the ${fmt(profile.length_m || profile.distance_m[profile.distance_m.length - 1], 0)} m river line · slope S = ${formatSlope(slopeAbs)} · ${ariNote}`
     );
     showXsViewer();
     requestAnimationFrame(() => drawXsProfile(xsProfile, xsProfile.options));
@@ -1078,9 +1403,12 @@ function renderResults(payload, { scroll = true } = {}) {
   resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects, sampled every ${payload.layout.sample_spacing_m} m.`;
-    const flow = payload.layout.flow_m3_s != null
-      ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${Number(payload.layout.slope).toExponential(2)}.`
-      : "";
+    const scenarios = visibleScenarios(payload);
+    const flow = scenarios.length
+      ? ` ${scenarios.map((item) => `${item.label} Q=${Number(item.flow_m3_s).toFixed(1)} m³/s`).join("; ")}, n=${payload.layout.mannings_n}, centreline slope S=${formatSlope(payload.layout.slope)}.`
+      : payload.layout.flow_m3_s != null
+        ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${formatSlope(payload.layout.slope)}.`
+        : "";
     const clipM = payload.layout.clip_size_m != null
       ? `, ${Number(payload.layout.clip_size_m).toFixed(0)} m clip`
       : "";
@@ -1097,8 +1425,11 @@ function renderResults(payload, { scroll = true } = {}) {
 
   const selectedId = selectedSection && selectedSection.type === "transect" ? selectedSection.id : null;
   const showCenterline = selectedSection && selectedSection.type === "centerline";
+  const tableScenario = visibleScenarios(payload)[0];
+  const tableKey = tableScenario && tableScenario.key;
   (payload.summary || []).forEach((row) => {
-    const status = row.overtopped ? "Overtops banks" : (row.conveys ? "OK" : "Cannot convey");
+    const hyd = hydFor(row, tableKey);
+    const status = hyd.overtopped ? "Overtops banks" : (hyd.conveys ? "OK" : "Cannot convey");
     const tr = document.createElement("tr");
     if (selectedId === row.transect) tr.classList.add("is-selected");
     tr.tabIndex = 0;
@@ -1107,13 +1438,13 @@ function renderResults(payload, { scroll = true } = {}) {
       <td>${row.transect}</td>
       <td>${fmt(row.offset_m, 1)}</td>
       <td>${row.n_samples ?? "—"}</td>
-      <td>${fmt(row.water_level_m, 2)}</td>
-      <td>${fmt(row.max_depth_m, 2)}</td>
-      <td>${fmt(row.width_m, 1)}</td>
-      <td>${fmt(row.area_m2, 1)}</td>
-      <td>${fmt(row.hydraulic_radius_m, 2)}</td>
-      <td>${fmt(row.velocity_m_s, 2)}</td>
-      <td>${fmt(row.discharge_m3_s, 2)}</td>
+      <td>${fmt(hyd.water_level_m, 2)}</td>
+      <td>${fmt(hyd.max_depth_m, 2)}</td>
+      <td>${fmt(hyd.width_m, 1)}</td>
+      <td>${fmt(hyd.area_m2, 1)}</td>
+      <td>${fmt(hyd.hydraulic_radius_m, 2)}</td>
+      <td>${fmt(hyd.velocity_m_s, 2)}</td>
+      <td>${fmt(hyd.discharge_m3_s, 2)}</td>
       <td>${status}</td>`;
     tr.addEventListener("click", () => selectSection({ type: "transect", id: row.transect }, { scroll: false }));
     resultsBody.appendChild(tr);
@@ -1124,7 +1455,7 @@ function renderResults(payload, { scroll = true } = {}) {
     fig.innerHTML = `
       <img src="${row.plot}" alt="Cross-section for transect ${row.transect}">
       <figcaption>Transect ${row.transect} · offset ${fmt(row.offset_m, 0)} m
-        · water level ${fmt(row.water_level_m, 2)} m
+        · water level ${fmt(hyd.water_level_m, 2)} m
         · <a href="${row.csv}">CSV</a></figcaption>`;
     plotsEl.appendChild(fig);
   });
@@ -1271,11 +1602,18 @@ runForm.addEventListener("input", (event) => {
     scheduleDemPreview();
     refreshLegend();
   }
+  if (event.target && event.target.matches("[data-ari]")) {
+    refreshAriPlot();
+  }
 });
 
 runForm.addEventListener("change", (event) => {
   if (event.target.name === "length") {
     scheduleDemPreview();
+  }
+  if (event.target && event.target.matches("[data-ari], [name^='flow_']")) {
+    syncAriInputs();
+    if (event.target.matches("[data-ari]")) refreshAriPlot();
   }
 });
 
@@ -1337,10 +1675,16 @@ runForm.addEventListener("submit", async (event) => {
     return;
   }
   const body = new FormData(runForm);
+  syncAriInputs();
   body.set("lat", String(lat));
   body.set("lon", String(lon));
   body.set("along", alongInput.value);
   body.set("centerline", JSON.stringify(drawn));
+  body.set("aris", arisJson ? arisJson.value : JSON.stringify(selectedAris().map((item) => ({
+    years: item.years,
+    flow_m3_s: item.flow_m3_s,
+  }))));
+  if (flowPrimary) body.set("flow", flowPrimary.value);
   const jobId = newJobId();
   body.set("job_id", jobId);
   runJobId = jobId;
@@ -1457,6 +1801,7 @@ if (demOpacityInput) {
   });
 }
 syncDemOpacityControl();
+syncAriInputs();
 
 window.addEventListener("resize", () => {
   adaptMapLayout();
