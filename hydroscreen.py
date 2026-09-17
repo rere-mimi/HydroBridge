@@ -33,7 +33,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from shapely.geometry import Point, LineString
+from shapely.geometry import Point, LineString, box
 from shapely.ops import split, nearest_points, substring
 from pyproj import Transformer
 
@@ -86,7 +86,11 @@ def check_cancelled(cancel_event):
 
 
 def _run_interruptibly(fn, cancel_event):
-    """Run a blocking call so Stop can return before a download finishes."""
+    """Run a blocking HTTP call so Stop can return before it finishes.
+
+    Do not use this for GDAL/vsicurl DEM clips. Those must stay on the
+    Flask request thread; a daemon worker can hang forever on local networks.
+    """
     if cancel_event is None:
         return fn()
     check_cancelled(cancel_event)
@@ -588,6 +592,52 @@ def preview_dem_overlay(
                 "clip_size_m": event["clip_size_m"],
             }
     return result
+
+
+def _line_parts(geom):
+    """Flatten a shapely geometry into LineString pieces with length."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "LineString":
+        return [geom] if geom.length > 0 else []
+    if geom.geom_type == "MultiLineString":
+        return [part for part in geom.geoms if part.length > 0]
+    if geom.geom_type == "GeometryCollection":
+        parts = []
+        for item in geom.geoms:
+            parts.extend(_line_parts(item))
+        return parts
+    return []
+
+
+def clip_line_to_raster(line, dem_path, lon=None, lat=None):
+    """Keep the centreline segment that sits on the DEM window, or None."""
+    if line is None or line.is_empty or len(line.coords) < 2:
+        return None
+    with rasterio.open(dem_path) as src:
+        to_src = _transformer("EPSG:4326", str(src.crs))
+        to_ll = _transformer(str(src.crs), "EPSG:4326")
+        west, south, east, north = (
+            float(src.bounds.left),
+            float(src.bounds.bottom),
+            float(src.bounds.right),
+            float(src.bounds.top),
+        )
+    proj_line = LineString([to_src.transform(x, y) for x, y in line.coords])
+    if proj_line.length <= 0:
+        return None
+    parts = _line_parts(proj_line.intersection(box(west, south, east, north)))
+    if not parts:
+        return None
+    if lon is not None and lat is not None:
+        pin = Point(*to_src.transform(float(lon), float(lat)))
+        part = min(parts, key=lambda geom: (geom.distance(pin), -geom.length))
+    else:
+        part = max(parts, key=lambda geom: geom.length)
+    coords = [to_ll.transform(x, y) for x, y in part.coords]
+    if len(coords) < 2:
+        return None
+    return LineString(coords)
 
 
 def centerline_reach(centerline, lon, lat, along_m):
@@ -1195,24 +1245,10 @@ def run_screening(
             centerline_source = "osm"
     check_cancelled(cancel_event)
 
-    transects = generate_transects(
-        centerline,
-        interval=interval,
-        n_each_side=n_each_side,
-        length_m=length,
-        bridge_lon=lon,
-        bridge_lat=lat,
-        along_m=along_m,
-        cover_full_line=cover_full_line,
-    )
-    if not transects:
-        raise HydroScreenError("No transects could be generated along the river centreline.")
-    logging.info("Generated %d transects", len(transects))
-    check_cancelled(cancel_event)
-
     dem_path = dem
     temp_dir = None
     dem_source_used = "local"
+    kept_dem = None
     bounds_2193 = square_clip_2193(lat, lon)
     bbox = bbox_4326_from_2193(bounds_2193)
     buffer_m = DEM_CLIP_SIZE_M / 2.0
@@ -1240,13 +1276,17 @@ def run_screening(
                 int(DEM_CLIP_SIZE_M),
                 int(DEM_CLIP_SIZE_M),
             )
-            linz_out = os.path.join(temp_dir, "linz_dem.tif")
+            # vsicurl must run on this request thread. Preview already uses
+            # that path; a daemon worker can hang forever after the overlay
+            # is visible. Write into the shared cache so Run reuses it.
+            cache_file = _cache_file_for(bbox, None, bounds_2193=bounds_2193)
             try:
-                dem_path = _run_interruptibly(
-                    lambda: download_linz_lidar_1m(bbox, linz_out, bounds_2193=bounds_2193),
-                    cancel_event,
+                check_cancelled(cancel_event)
+                dem_path = download_linz_lidar_1m(
+                    bbox, str(cache_file), bounds_2193=bounds_2193
                 )
                 dem_source_used = "linz-lidar-1m"
+                check_cancelled(cancel_event)
             except HydroScreenError:
                 raise
             except Exception as exc:
@@ -1255,6 +1295,13 @@ def run_screening(
                     "Could not download the New Zealand LiDAR 1m DEM. "
                     f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
                 ) from exc
+            kept_dem = Path(outdir) / "dem_500m.tif"
+            try:
+                if Path(dem_path).resolve() != kept_dem.resolve():
+                    shutil.copyfile(dem_path, kept_dem)
+            except OSError as exc:
+                logging.warning("Could not copy DEM clip into outputs: %s", exc)
+                kept_dem = None
 
     if dem_path is None:
         raise HydroScreenError(
@@ -1267,10 +1314,46 @@ def run_screening(
         )
 
     check_cancelled(cancel_event)
+    clipped = clip_line_to_raster(centerline, dem_path, lon=lon, lat=lat)
+    if clipped is None:
+        raise HydroScreenError(
+            "The river centreline does not overlap the LiDAR window. "
+            "Draw it through the DEM overlay around the bridge pin."
+        )
+    original_len = projected_length_m(centerline)
+    clipped_len = projected_length_m(clipped)
+    if clipped_len + 1.0 < original_len:
+        logging.info(
+            "Clipped centreline to the DEM window (%.0f m → %.0f m)",
+            original_len,
+            clipped_len,
+        )
+    centerline = clipped
+    if cover_full_line:
+        along_m = clipped_len
+
     if cover_full_line:
         reach = centerline
     else:
         reach = centerline_reach(centerline, lon, lat, along_m)
+        reach_clipped = clip_line_to_raster(reach, dem_path, lon=lon, lat=lat)
+        if reach_clipped is not None:
+            reach = reach_clipped
+
+    transects = generate_transects(
+        centerline,
+        interval=interval,
+        n_each_side=n_each_side,
+        length_m=length,
+        bridge_lon=lon,
+        bridge_lat=lat,
+        along_m=along_m,
+        cover_full_line=cover_full_line,
+    )
+    if not transects:
+        raise HydroScreenError("No transects could be generated along the river centreline.")
+    logging.info("Generated %d transects", len(transects))
+    check_cancelled(cancel_event)
 
     summary = []
     data_rows = []
@@ -1374,6 +1457,8 @@ def run_screening(
             "dem_source": dem_source_used,
             "dem_layer": LINZ_LIDAR_1M_LAYER if dem_source_used == "linz-lidar-1m" else None,
             "dem_buffer_m": float(buffer_m),
+            "dem_file": kept_dem.name if kept_dem else None,
+            "clip_size_m": float(DEM_CLIP_SIZE_M),
         },
         "temp_dem": temp_dir,
     }

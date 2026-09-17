@@ -24,6 +24,7 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="dem-opacity"', html)
         self.assertIn("500 m", html)
         self.assertIn("busy-spinner", html)
+        self.assertIn("screening-dem", html)
         self.assertNotIn("disabled>Run screening", html)
 
     def test_dem_preview_stream_reports_percent(self):
