@@ -95,6 +95,58 @@ body.mode-xs #map {
     linear-gradient(150deg, #38bdf8, #0369a1);
 }
 
+.busy {
+  position: fixed;
+  z-index: 1600;
+  top: 4.55rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.55rem 0.95rem;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+  font-weight: 650;
+  font-size: 0.9rem;
+  pointer-events: none;
+}
+
+.busy[hidden] { display: none !important; }
+
+.spinner {
+  width: 1.05rem;
+  height: 1.05rem;
+  border: 2.5px solid rgba(248, 250, 252, 0.28);
+  border-top-color: #38bdf8;
+  border-radius: 999px;
+  animation: spin 0.7s linear infinite;
+}
+
+.spinner-btn {
+  width: 0.95rem;
+  height: 0.95rem;
+  border-color: rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  display: inline-block;
+  vertical-align: -0.15rem;
+  margin-right: 0.4rem;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+body.is-busy .mark {
+  animation: pulse-mark 0.9s ease-in-out infinite;
+}
+
+@keyframes pulse-mark {
+  50% { transform: scale(1.12); filter: brightness(1.25); }
+}
+
 .search {
   position: relative;
   display: flex;
@@ -418,6 +470,9 @@ button { font: inherit; cursor: pointer; }
   color: white;
   font-weight: 650;
   padding: 0.72rem 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .primary:disabled,
