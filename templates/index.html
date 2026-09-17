@@ -157,31 +157,17 @@
       </span>
     </label>
 
-    <fieldset class="field">
-      <legend class="field-label">
+    <div class="field">
+      <span class="field-label">
         Elevation data
         <button type="button" class="help" aria-label="What elevation data is used?" data-help="help-dem">?</button>
-      </legend>
-      <span id="help-dem" class="help-pop" role="tooltip" hidden>
-        HydroBridge clips a 500 m × 500 m square of the New Zealand LiDAR 1 m DEM around the pin and draws it on the map. Use the sample DEM offline, or upload a GeoTIFF that covers the site.
       </span>
-      <label class="choice">
-        <input type="radio" name="dem_source" value="linz" checked>
-        New Zealand LiDAR 1 m DEM
-      </label>
-      <label class="choice">
-        <input type="radio" name="dem_source" value="sample">
-        Bundled Wellington sample (offline)
-      </label>
-      <label class="choice">
-        <input type="radio" name="dem_source" value="upload">
-        Upload a GeoTIFF
-      </label>
-      <label id="dem-file-wrap" class="file" hidden>
-        DEM file
-        <input id="dem-file" name="dem" type="file" accept=".tif,.tiff,image/tiff">
-      </label>
-    </fieldset>
+      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ 121859). HydroBridge selects the Topo50 tiles that cover a 500 m square around the pin and downloads only that window.</p>
+      <p class="muted" id="dem-tiles" hidden></p>
+      <span id="help-dem" class="help-pop" role="tooltip" hidden>
+        When you pin a bridge, HydroBridge looks up the LINZ 1 m LiDAR COG sheets that intersect a 500 m NZTM square, then clips that square over HTTP. Screening uses the same GeoTIFF.
+      </span>
+    </div>
 
     <input id="lat" name="lat" type="hidden">
     <input id="lon" name="lon" type="hidden">
@@ -248,6 +234,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=screening-dem"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=linz-only"></script>
 </body>
 </html>

@@ -332,6 +332,61 @@ def linz_tiles_for_bbox(bbox, tiles=None):
     return sorted(hits)
 
 
+def plan_linz_clip(lat, lon, size_m=None, snap_m=None):
+    """Choose LINZ 1 m COG tiles for the 500 m square around a bridge pin.
+
+    Methodology:
+    1. Project the pin to NZTM (EPSG:2193) and snap it so nearby clicks share a window.
+    2. Build a fixed 500 m × 500 m square in NZTM centred on that snap.
+    3. Convert the square to a WGS84 envelope.
+    4. Intersect that envelope with the bundled Topo50 index for LINZ layer 121859.
+    5. Return only those sheet codes and their public COG URLs.
+
+    Full 1:50k GeoTIFFs are never saved. clip_dem_tiles window-reads just the
+    500 m square from those COGs over HTTP range requests.
+    """
+    bounds_2193 = square_clip_2193(lat, lon, size_m=size_m, snap_m=snap_m)
+    bbox_4326 = bbox_4326_from_2193(bounds_2193)
+    tiles = linz_tiles_for_bbox(bbox_4326)
+    uris = [f"/vsicurl/{LINZ_LIDAR_1M_BASE}{code}.tiff" for code in tiles]
+    clip_size = float(DEM_CLIP_SIZE_M if size_m is None else size_m)
+    return {
+        "lat": float(lat),
+        "lon": float(lon),
+        "clip_size_m": clip_size,
+        "bounds_2193": tuple(float(v) for v in bounds_2193),
+        "bbox_4326": tuple(float(v) for v in bbox_4326),
+        "tiles": tiles,
+        "uris": uris,
+        "layer": LINZ_LIDAR_1M_LAYER,
+        "base_url": LINZ_LIDAR_1M_BASE,
+    }
+
+
+def extract_linz_dem_for_bridge(lat, lon, out_tif, progress=None):
+    """Download the 500 m LINZ LiDAR clip for a chosen bridge. Returns (path, plan)."""
+    plan = plan_linz_clip(lat, lon)
+    if not plan["tiles"]:
+        raise HydroScreenError(
+            "This site is outside the New Zealand LiDAR 1m DEM coverage "
+            f"({LINZ_LIDAR_1M_LAYER})."
+        )
+    logging.info(
+        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (%.0f m clip)",
+        plan["lat"],
+        plan["lon"],
+        ", ".join(plan["tiles"]),
+        plan["clip_size_m"],
+    )
+    path = download_linz_lidar_1m(
+        plan["bbox_4326"],
+        out_tif,
+        bounds_2193=plan["bounds_2193"],
+        progress=progress,
+    )
+    return path, plan
+
+
 def _emit_progress(progress, fraction, message=None):
     if progress is None:
         return
@@ -531,14 +586,24 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
     temp_dir = None
     src_path = dem_path
     source = "local"
+    linz_tiles = []
     try:
         if src_path is None:
             yield {"percent": 8, "message": "Finding DEM tiles"}
+            plan = plan_linz_clip(lat, lon)
+            if not plan["tiles"]:
+                raise HydroScreenError(
+                    "This site is outside the New Zealand LiDAR 1m DEM coverage "
+                    f"({LINZ_LIDAR_1M_LAYER})."
+                )
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
-            yield {"percent": 15, "message": "Downloading DEM"}
+            yield {
+                "percent": 15,
+                "message": f"Downloading DEM from {', '.join(plan['tiles'])}",
+            }
             try:
-                download_linz_lidar_1m(bbox, src_path, bounds_2193=bounds_2193)
+                src_path, plan = extract_linz_dem_for_bridge(lat, lon, src_path)
             except HydroScreenError:
                 raise
             except Exception as exc:
@@ -548,6 +613,7 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
                     f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
                 ) from exc
             source = "linz-lidar-1m"
+            linz_tiles = plan["tiles"]
             yield {"percent": 85, "message": "Drawing DEM overlay"}
         else:
             yield {"percent": 40, "message": "Reading DEM"}
@@ -561,6 +627,7 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
             "source": source,
             "radius_m": float(radius),
             "clip_size_m": DEM_CLIP_SIZE_M,
+            "tiles": list(linz_tiles),
         }
     finally:
         if temp_dir:
@@ -590,6 +657,7 @@ def preview_dem_overlay(
                 "source": event["source"],
                 "radius_m": event["radius_m"],
                 "clip_size_m": event["clip_size_m"],
+                "tiles": event.get("tiles") or [],
             }
     return result
 
@@ -938,11 +1006,9 @@ def sample_drawn_cross_section(
             except (TypeError, ValueError):
                 clip_lat = 0.5 * (lat1 + lat2)
                 clip_lon = 0.5 * (lon1 + lon2)
-            bounds_2193 = square_clip_2193(clip_lat, clip_lon)
-            bbox = bbox_4326_from_2193(bounds_2193)
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_xs_")
             dem_path = os.path.join(temp_dir, "dem.tif")
-            download_linz_lidar_1m(bbox, dem_path, bounds_2193=bounds_2193)
+            dem_path, _plan = extract_linz_dem_for_bridge(clip_lat, clip_lon, dem_path)
             source = "linz-lidar-1m"
         dists, elevs, _coords = sample_dem_along_line(dem_path, line, spacing_m=spacing_m)
         finite = elevs[np.isfinite(elevs)]
@@ -1249,6 +1315,7 @@ def run_screening(
     temp_dir = None
     dem_source_used = "local"
     kept_dem = None
+    linz_tiles = []
     bounds_2193 = square_clip_2193(lat, lon)
     bbox = bbox_4326_from_2193(bounds_2193)
     buffer_m = DEM_CLIP_SIZE_M / 2.0
@@ -1282,9 +1349,8 @@ def run_screening(
             cache_file = _cache_file_for(bbox, None, bounds_2193=bounds_2193)
             try:
                 check_cancelled(cancel_event)
-                dem_path = download_linz_lidar_1m(
-                    bbox, str(cache_file), bounds_2193=bounds_2193
-                )
+                dem_path, plan = extract_linz_dem_for_bridge(lat, lon, str(cache_file))
+                linz_tiles = plan["tiles"]
                 dem_source_used = "linz-lidar-1m"
                 check_cancelled(cancel_event)
             except HydroScreenError:
@@ -1305,7 +1371,7 @@ def run_screening(
 
     if dem_path is None:
         raise HydroScreenError(
-            "No DEM available. Provide a local GeoTIFF or allow HydroBridge to clip the New Zealand LiDAR 1m DEM."
+            "Could not clip the New Zealand LiDAR 1m DEM for this bridge."
         )
 
     if dem_source_used == "local" and not _raster_covers_bbox(dem_path, bbox_from_point(lat, lon, 50)):
@@ -1459,6 +1525,7 @@ def run_screening(
             "dem_buffer_m": float(buffer_m),
             "dem_file": kept_dem.name if kept_dem else None,
             "clip_size_m": float(DEM_CLIP_SIZE_M),
+            "tiles": list(linz_tiles),
         },
         "temp_dem": temp_dir,
     }

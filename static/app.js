@@ -17,7 +17,7 @@ const resultsBody = document.getElementById("results-body");
 const resultsNote = document.getElementById("results-note");
 const plotsEl = document.getElementById("plots");
 const summaryLink = document.getElementById("summary-link");
-const demFileWrap = document.getElementById("dem-file-wrap");
+const demTilesEl = document.getElementById("dem-tiles");
 const modeDrawBtn = document.getElementById("mode-draw");
 const modeXsBtn = document.getElementById("mode-xs");
 const undoBtn = document.getElementById("undo-vertex");
@@ -159,6 +159,7 @@ let runReady = false;
 let runBlockReason = "Double-click the map to pin a bridge, then draw the river.";
 let busyCount = 0;
 let lastPreviewKey = "";
+let demTiles = [];
 let demProgressOn = false;
 let demTransparency = 50;
 try {
@@ -289,11 +290,6 @@ function currentLatLon() {
   };
 }
 
-function currentDemSource() {
-  const picked = runForm.querySelector('input[name="dem_source"]:checked');
-  return picked ? picked.value : "linz";
-}
-
 function lineLengthM(latlngs) {
   let metres = 0;
   for (let i = 1; i < latlngs.length; i += 1) {
@@ -334,9 +330,10 @@ function refreshLegend() {
     items.push({ swatch: "river", label: "River centreline (drawing…)" });
   }
   if (demOverlay) {
+    const sheets = demTiles.length ? ` · ${demTiles.join(", ")}` : "";
     items.push({
       swatch: "dem",
-      label: `LiDAR DEM (${Math.round(demTransparency)}% transparent)`,
+      label: `LiDAR DEM 500 m${sheets} (${Math.round(demTransparency)}% transparent)`,
     });
   }
   if (ranTransects) {
@@ -420,6 +417,11 @@ function clearDemOverlay() {
     URL.revokeObjectURL(demOverlayUrl);
     demOverlayUrl = null;
   }
+  demTiles = [];
+  if (demTilesEl) {
+    demTilesEl.hidden = true;
+    demTilesEl.textContent = "";
+  }
   refreshLegend();
 }
 
@@ -466,30 +468,16 @@ async function readPreviewStream(res) {
 async function refreshDemOverlay() {
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
-  const source = currentDemSource();
-  const upload = document.getElementById("dem-file");
-  const uploadName = source === "upload" && upload && upload.files && upload.files[0]
-    ? upload.files[0].name + upload.files[0].size
-    : "";
-  if (source === "upload" && !uploadName) {
-    clearDemOverlay();
-    lastPreviewKey = "";
-    return;
-  }
-  const key = [lat.toFixed(5), lon.toFixed(5), source, alongInput.value || "300", runForm.length.value, uploadName].join("|");
+  const key = [lat.toFixed(5), lon.toFixed(5), alongInput.value || "300", runForm.length.value].join("|");
   if (key === lastPreviewKey && demOverlay) return;
   const seq = (demPreviewSeq += 1);
   const body = new FormData();
   body.set("lat", String(lat));
   body.set("lon", String(lon));
-  body.set("dem_source", source);
   body.set("along", alongInput.value || "300");
   body.set("length", runForm.length.value);
   body.set("stream", "1");
-  if (source === "upload") {
-    body.set("dem", upload.files[0]);
-  }
-  showDemProgress(0, "Downloading DEM…");
+  showDemProgress(0, "Finding LINZ tiles…");
   try {
     const res = await fetch("/api/dem-preview?stream=1", { method: "POST", body });
     const data = await readPreviewStream(res);
@@ -497,11 +485,18 @@ async function refreshDemOverlay() {
     if (!res.ok || data.error || !data.png || !data.bounds) {
       clearDemOverlay();
       lastPreviewKey = "";
-      setStatus(data.error || "Could not download the DEM for this site.", "error");
+      setStatus(data.error || "Could not download the LINZ DEM for this site.", "error");
       return;
     }
     const bytes = Uint8Array.from(atob(data.png), (ch) => ch.charCodeAt(0));
     clearDemOverlay();
+    demTiles = Array.isArray(data.tiles) ? data.tiles : [];
+    if (demTilesEl) {
+      demTilesEl.hidden = demTiles.length === 0;
+      demTilesEl.textContent = demTiles.length
+        ? `Tiles for this pin: ${demTiles.join(", ")}`
+        : "";
+    }
     demOverlayUrl = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
     demOverlay = L.imageOverlay(demOverlayUrl, data.bounds, {
       opacity: demOverlayOpacity(),
@@ -515,7 +510,7 @@ async function refreshDemOverlay() {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
     lastPreviewKey = "";
-    setStatus((err && err.message) || "Could not download the DEM.", "error");
+    setStatus((err && err.message) || "Could not download the LINZ DEM.", "error");
   } finally {
     if (seq === demPreviewSeq) hideDemProgress();
   }
@@ -755,11 +750,6 @@ async function requestXsProfile(start, end) {
   body.set("lat1", String(start.lat));
   body.set("lon2", String(end.lng));
   body.set("lat2", String(end.lat));
-  body.set("dem_source", currentDemSource());
-  if (currentDemSource() === "upload") {
-    const file = document.getElementById("dem-file");
-    if (file && file.files && file.files[0]) body.set("dem", file.files[0]);
-  }
   setXsMeta("Sampling the DEM…");
   showXsViewer();
   setBusy(true, "Sampling DEM…");
@@ -928,8 +918,11 @@ function renderResults(payload) {
     const clipM = payload.layout.clip_size_m != null
       ? `, ${Number(payload.layout.clip_size_m).toFixed(0)} m clip`
       : "";
+    const sheets = Array.isArray(payload.layout.tiles) && payload.layout.tiles.length
+      ? ` from ${payload.layout.tiles.join(", ")}`
+      : "";
     const dem = payload.layout.dem_source === "linz-lidar-1m"
-      ? ` Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859${clipM}).`
+      ? ` Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859${clipM}${sheets}).`
       : "";
     resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}${dem}`;
   }
@@ -1107,12 +1100,7 @@ runForm.addEventListener("input", (event) => {
 });
 
 runForm.addEventListener("change", (event) => {
-  if (event.target.name === "dem_source") {
-    demFileWrap.hidden = event.target.value !== "upload";
-    scheduleDemPreview();
-    return;
-  }
-  if (event.target.name === "dem" || event.target.name === "length") {
+  if (event.target.name === "length") {
     scheduleDemPreview();
   }
 });
