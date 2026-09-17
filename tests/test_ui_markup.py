@@ -18,6 +18,12 @@ def _fake_extract(lat, lon, out_tif, progress=None):
     return str(out_tif), plan_linz_clip(lat, lon)
 
 
+def _fake_iter_extract(lat, lon, out_tif):
+    path, plan = _fake_extract(lat, lon, out_tif)
+    yield {"percent": 8, "message": "Downloading", "plan": plan}
+    yield {"percent": 100, "message": "DEM ready", "path": path, "plan": plan}
+
+
 class UiMarkupTests(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
@@ -36,15 +42,19 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="dem-opacity"', html)
         self.assertIn("500 m", html)
         self.assertIn("busy-spinner", html)
-        self.assertIn("linz-only", html)
+        self.assertIn("tiles-layout", html)
         self.assertIn("id=\"dem-tiles\"", html)
         self.assertIn("LINZ 121859", html)
+        self.assertIn("class=\"app-frame\"", html)
+        self.assertIn("class=\"workspace\"", html)
+        self.assertIn("class=\"map-stage\"", html)
+        self.assertIn("outputs/linz-tiles", html)
         self.assertNotIn("Bundled Wellington", html)
         self.assertNotIn("Upload a GeoTIFF", html)
         self.assertNotIn("disabled>Run screening", html)
 
     def test_dem_preview_stream_reports_percent(self):
-        with patch("hydroscreen.extract_linz_dem_for_bridge", side_effect=_fake_extract):
+        with patch("hydroscreen.iter_extract_linz_dem_for_bridge", side_effect=_fake_iter_extract):
             response = self.client.post(
                 "/api/dem-preview?stream=1",
                 data={

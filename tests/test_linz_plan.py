@@ -1,4 +1,4 @@
-"""Methodology: pick LINZ 1 m COG tiles for the chosen bridge pin."""
+"""Methodology: pick LINZ 1 m tiles, download them, then clip locally."""
 
 import os
 import tempfile
@@ -26,6 +26,10 @@ class PlanLinzClipTests(unittest.TestCase):
         self.assertTrue(plan["uris"])
         self.assertTrue(all(uri.endswith(".tiff") for uri in plan["uris"]))
         self.assertTrue(any("BQ31.tiff" in uri for uri in plan["uris"]))
+        self.assertTrue(all(uri.startswith("https://") for uri in plan["uris"]))
+        self.assertTrue(all("/vsicurl/" not in uri for uri in plan["uris"]))
+        self.assertTrue(any(path.endswith("BQ31.tiff") for path in plan["paths"]))
+        self.assertIn("linz-tiles", plan["tile_dir"])
 
     def test_christchurch_pin_selects_bx24(self):
         plan = plan_linz_clip(-43.532, 172.6362)
@@ -47,6 +51,12 @@ class PlanLinzClipTests(unittest.TestCase):
         plan = plan_linz_clip(-41.2865, 174.7762)
         seen = {}
 
+        def fake_download(code):
+            dest = Path(os.environ["HYDROBRIDGE_LINZ_TILES"]) / f"{code}.tiff"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"FULL-TILE" * 40)
+            yield 1.0, f"Saved {code}"
+
         def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
             seen["uris"] = list(uris)
             seen["bounds"] = bounds
@@ -56,14 +66,52 @@ class PlanLinzClipTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "bridge.tif"
-            with patch.dict(os.environ, {"HYDROBRIDGE_DEM_CACHE": str(Path(tmp) / "cache")}):
-                with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
-                    path, used = extract_linz_dem_for_bridge(-41.2865, 174.7762, str(out))
+            tiles = str(Path(tmp) / "linz-tiles")
+            cache = str(Path(tmp) / "cache")
+            with patch.dict(
+                os.environ,
+                {"HYDROBRIDGE_DEM_CACHE": cache, "HYDROBRIDGE_LINZ_TILES": tiles},
+            ):
+                with patch("hydroscreen.iter_download_linz_tile", side_effect=fake_download):
+                    with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
+                        path, used = extract_linz_dem_for_bridge(-41.2865, 174.7762, str(out))
             self.assertEqual(path, str(out))
             self.assertEqual(used["tiles"], plan["tiles"])
-            self.assertEqual(seen["uris"], plan["uris"])
+            self.assertEqual(seen["uris"], used["paths"])
             self.assertEqual(seen["bounds"], plan["bounds_2193"])
             self.assertGreater(Path(path).stat().st_size, 256)
+            self.assertTrue(all(Path(p).exists() for p in used["paths"]))
+
+    def test_extract_still_downloads_tiles_when_the_clip_is_cached(self):
+        downloads = []
+
+        def fake_download(code):
+            downloads.append(code)
+            dest = Path(os.environ["HYDROBRIDGE_LINZ_TILES"]) / f"{code}.tiff"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"FULL-TILE" * 40)
+            yield 1.0, f"Saved {code}"
+
+        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
+            Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_tif).write_bytes(b"LINZ-CLIP" * 40)
+            return out_tif
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "HYDROBRIDGE_DEM_CACHE": str(Path(tmp) / "cache"),
+                "HYDROBRIDGE_LINZ_TILES": str(Path(tmp) / "linz-tiles"),
+            }
+            with patch.dict(os.environ, env):
+                with patch("hydroscreen.iter_download_linz_tile", side_effect=fake_download):
+                    with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
+                        first = Path(tmp) / "a.tif"
+                        second = Path(tmp) / "b.tif"
+                        extract_linz_dem_for_bridge(-41.2865, 174.7762, str(first))
+                        extract_linz_dem_for_bridge(-41.2865, 174.7762, str(second))
+            self.assertGreaterEqual(len(downloads), 2)
+            self.assertTrue(second.exists())
+            self.assertEqual(second.read_bytes(), first.read_bytes())
 
     def test_extract_rejects_a_pin_outside_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:

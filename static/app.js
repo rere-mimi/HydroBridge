@@ -406,6 +406,7 @@ function syncChrome() {
   }
   refreshLegend();
   updateLayoutPreview();
+  adaptMapLayout();
 }
 
 function clearDemOverlay() {
@@ -506,6 +507,8 @@ async function refreshDemOverlay() {
     }).addTo(map);
     lastPreviewKey = key;
     refreshLegend();
+    adaptMapLayout();
+    map.fitBounds(data.bounds, { padding: [28, 28], maxZoom: 17, animate: false });
   } catch (err) {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
@@ -714,15 +717,15 @@ function drawXsProfile(profile) {
 
 function showXsViewer() {
   xsViewer.hidden = false;
+  adaptMapLayout();
   requestAnimationFrame(() => {
-    map.invalidateSize();
     if (xsProfile) drawXsProfile(xsProfile);
   });
 }
 
 function hideXsViewer() {
   xsViewer.hidden = true;
-  requestAnimationFrame(() => map.invalidateSize());
+  adaptMapLayout();
 }
 
 function setXsMeta(text) {
@@ -904,6 +907,7 @@ function drawRunGeometry(payload) {
 
 function renderResults(payload) {
   resultsEl.hidden = false;
+  adaptMapLayout();
   resultsBody.innerHTML = "";
   plotsEl.innerHTML = "";
   const lengthNote = payload.layout?.along_m != null
@@ -1226,13 +1230,23 @@ document.querySelector(".run-actions").addEventListener("click", (event) => {
   setStatus(runBlockReason || "Finish placing the bridge and river before running.", "error");
 });
 
+function adaptMapLayout() {
+  document.body.classList.toggle("has-params", Boolean(runForm && !runForm.hidden));
+  document.body.classList.toggle("has-xs", Boolean(xsViewer && !xsViewer.hidden));
+  document.body.classList.toggle("has-results", Boolean(resultsEl && !resultsEl.hidden));
+  requestAnimationFrame(() => {
+    map.invalidateSize();
+    if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile);
+  });
+}
+
 ["coach", "run-form", "legend", "xs-viewer", "name-modal"].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
   L.DomEvent.disableClickPropagation(el);
   L.DomEvent.disableScrollPropagation(el);
 });
-document.querySelectorAll(".chrome, .basemap-switch, .brand, .search").forEach((el) => {
+document.querySelectorAll(".chrome, .basemap-switch, .brand, .search, .rail").forEach((el) => {
   L.DomEvent.disableClickPropagation(el);
   L.DomEvent.disableScrollPropagation(el);
 });
@@ -1271,8 +1285,13 @@ if (demOpacityInput) {
 syncDemOpacityControl();
 
 window.addEventListener("resize", () => {
-  if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile);
+  adaptMapLayout();
 });
+
+const mapStage = document.querySelector(".map-stage");
+if (mapStage && typeof ResizeObserver === "function") {
+  new ResizeObserver(() => map.invalidateSize()).observe(mapStage);
+}
 
 setMode("idle");
 syncChrome();

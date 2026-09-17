@@ -8,8 +8,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-  <div id="map" role="application" aria-label="Map centred on Christchurch. Double-click to pin a bridge, then draw the river centreline."></div>
-
+  <div class="app-frame">
   <header class="chrome">
     <div class="brand">
       <span class="mark" aria-hidden="true"></span>
@@ -26,19 +25,8 @@
     </form>
   </header>
 
-  <div id="busy" class="busy" hidden role="status" aria-live="polite">
-    <span class="spinner" id="busy-spinner" aria-hidden="true"></span>
-    <div class="busy-copy">
-      <div class="busy-row">
-        <span id="busy-text">Working…</span>
-        <span id="busy-pct" hidden>0%</span>
-      </div>
-      <div id="busy-bar" class="progress" hidden>
-        <div id="busy-bar-fill" class="progress-fill"></div>
-      </div>
-    </div>
-  </div>
-
+  <div class="workspace">
+  <aside class="rail rail-start">
   <aside id="coach" class="card coach" aria-live="polite">
     <p id="map-hint" class="coach-copy">Navigate the map, then double-click a bridge to drop a pin.</p>
     <p id="status" class="status" role="status"></p>
@@ -54,12 +42,6 @@
     </div>
   </aside>
 
-  <div class="basemap-switch" role="radiogroup" aria-label="Basemap">
-    <button type="button" data-basemap="map" aria-pressed="true">Map</button>
-    <button type="button" data-basemap="earth" aria-pressed="false">Earth</button>
-    <button type="button" data-basemap="topo" aria-pressed="false">Topo</button>
-  </div>
-
   <aside id="legend" class="card legend">
     <h2>Legend</h2>
     <ul id="legend-list">
@@ -74,7 +56,30 @@
     </label>
   </aside>
 
-  <form id="run-form" class="card params" hidden novalidate>
+  <div class="basemap-switch" role="radiogroup" aria-label="Basemap">
+    <button type="button" data-basemap="map" aria-pressed="true">Map</button>
+    <button type="button" data-basemap="earth" aria-pressed="false">Earth</button>
+    <button type="button" data-basemap="topo" aria-pressed="false">Topo</button>
+  </div>
+  </aside>
+
+  <div class="map-stage">
+  <div id="map" role="application" aria-label="Map centred on Christchurch. Double-click to pin a bridge, then draw the river centreline."></div>
+  <div id="busy" class="busy" hidden role="status" aria-live="polite">
+    <span class="spinner" id="busy-spinner" aria-hidden="true"></span>
+    <div class="busy-copy">
+      <div class="busy-row">
+        <span id="busy-text">Working…</span>
+        <span id="busy-pct" hidden>0%</span>
+      </div>
+      <div id="busy-bar" class="progress" hidden>
+        <div id="busy-bar-fill" class="progress-fill"></div>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <form id="run-form" class="card params rail rail-end" hidden novalidate>
     <div class="params-head">
       <h2>Hydrology</h2>
       <p id="bridge-summary" class="muted">Name a bridge, then draw its river centreline.</p>
@@ -162,10 +167,10 @@
         Elevation data
         <button type="button" class="help" aria-label="What elevation data is used?" data-help="help-dem">?</button>
       </span>
-      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ 121859). HydroBridge selects the Topo50 tiles that cover a 500 m square around the pin and downloads only that window.</p>
+      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ 121859). HydroBridge identifies the Topo50 tiles the 500 m bridge square touches, downloads those full GeoTIFFs into outputs/linz-tiles, then clips the window locally.</p>
       <p class="muted" id="dem-tiles" hidden></p>
       <span id="help-dem" class="help-pop" role="tooltip" hidden>
-        When you pin a bridge, HydroBridge looks up the LINZ 1 m LiDAR COG sheets that intersect a 500 m NZTM square, then clips that square over HTTP. Screening uses the same GeoTIFF.
+        When you pin a bridge, HydroBridge looks up the LINZ 1 m LiDAR sheets that intersect a 500 m NZTM square, saves those full tiles under outputs/linz-tiles/, then clips that square on disk. Screening uses the local 500 m GeoTIFF.
       </span>
     </div>
 
@@ -179,6 +184,16 @@
       <p id="run-status" class="status" role="status"></p>
     </div>
   </form>
+  </div>
+
+  <section id="xs-viewer" class="xs-viewer" hidden>
+    <div class="xs-head">
+      <h2>DEM cross-section</h2>
+      <p id="xs-meta" class="muted">Left-click two points on the map.</p>
+    </div>
+    <canvas id="xs-canvas" aria-label="DEM elevation along the drawn line"></canvas>
+  </section>
+  </div>
 
   <div id="name-modal" class="modal" hidden>
     <form id="name-form" class="card modal-card">
@@ -195,14 +210,6 @@
       </div>
     </form>
   </div>
-
-  <section id="xs-viewer" class="xs-viewer" hidden>
-    <div class="xs-head">
-      <h2>DEM cross-section</h2>
-      <p id="xs-meta" class="muted">Left-click two points on the map.</p>
-    </div>
-    <canvas id="xs-canvas" aria-label="DEM elevation along the drawn line"></canvas>
-  </section>
 
   <section id="results" class="results" hidden>
     <div class="results-head">
@@ -234,6 +241,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=linz-only"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=tiles-layout"></script>
 </body>
 </html>

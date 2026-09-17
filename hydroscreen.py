@@ -59,6 +59,9 @@ LINZ_LIDAR_1M_BASE = (
     "https://nz-elevation.s3-ap-southeast-2.amazonaws.com/new-zealand/new-zealand/dem_1m/2193/"
 )
 LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
+LINZ_TILE_CHUNK = 1024 * 1024
+LINZ_HTTP_HEADERS = {"User-Agent": "HydroBridge/0.1"}
+LINZ_HTTP_TIMEOUT = (20, 120)
 DEM_CLIP_SIZE_M = 500.0
 DEM_CLIP_SNAP_M = 20.0
 MAX_DEM_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
@@ -123,6 +126,22 @@ def dem_cache_dir():
     if override:
         return Path(override)
     return Path(tempfile.gettempdir()) / "hydrobridge-dem-cache"
+
+
+def linz_tile_dir():
+    """Folder for full LINZ Topo50 GeoTIFFs (outputs/linz-tiles by default)."""
+    override = os.environ.get("HYDROBRIDGE_LINZ_TILES")
+    if override:
+        return Path(override)
+    return ROOT / "outputs" / "linz-tiles"
+
+
+def linz_tile_url(code):
+    return f"{LINZ_LIDAR_1M_BASE}{code}.tiff"
+
+
+def linz_tile_path(code):
+    return linz_tile_dir() / f"{code}.tiff"
 
 
 def expand_bbox_for_cache(bbox, step=0.005):
@@ -333,22 +352,23 @@ def linz_tiles_for_bbox(bbox, tiles=None):
 
 
 def plan_linz_clip(lat, lon, size_m=None, snap_m=None):
-    """Choose LINZ 1 m COG tiles for the 500 m square around a bridge pin.
+    """Choose LINZ 1 m tiles for the 500 m square around a bridge pin.
 
     Methodology:
     1. Project the pin to NZTM (EPSG:2193) and snap it so nearby clicks share a window.
     2. Build a fixed 500 m × 500 m square in NZTM centred on that snap.
     3. Convert the square to a WGS84 envelope.
     4. Intersect that envelope with the bundled Topo50 index for LINZ layer 121859.
-    5. Return only those sheet codes and their public COG URLs.
+    5. Return those sheet codes, public HTTPS URLs, and local download paths.
 
-    Full 1:50k GeoTIFFs are never saved. clip_dem_tiles window-reads just the
-    500 m square from those COGs over HTTP range requests.
+    Full intersecting GeoTIFFs are downloaded into outputs/linz-tiles/. The 500 m
+    bridge window is clipped from those local files, not cropped over HTTP.
     """
     bounds_2193 = square_clip_2193(lat, lon, size_m=size_m, snap_m=snap_m)
     bbox_4326 = bbox_4326_from_2193(bounds_2193)
     tiles = linz_tiles_for_bbox(bbox_4326)
-    uris = [f"/vsicurl/{LINZ_LIDAR_1M_BASE}{code}.tiff" for code in tiles]
+    urls = [linz_tile_url(code) for code in tiles]
+    paths = [str(linz_tile_path(code)) for code in tiles]
     clip_size = float(DEM_CLIP_SIZE_M if size_m is None else size_m)
     return {
         "lat": float(lat),
@@ -357,14 +377,133 @@ def plan_linz_clip(lat, lon, size_m=None, snap_m=None):
         "bounds_2193": tuple(float(v) for v in bounds_2193),
         "bbox_4326": tuple(float(v) for v in bbox_4326),
         "tiles": tiles,
-        "uris": uris,
+        "urls": urls,
+        "uris": urls,
+        "paths": paths,
+        "tile_dir": str(linz_tile_dir()),
         "layer": LINZ_LIDAR_1M_LAYER,
         "base_url": LINZ_LIDAR_1M_BASE,
     }
 
 
-def extract_linz_dem_for_bridge(lat, lon, out_tif, progress=None):
-    """Download the 500 m LINZ LiDAR clip for a chosen bridge. Returns (path, plan)."""
+def _head_linz_tile_size(url):
+    try:
+        response = requests.head(
+            url,
+            timeout=LINZ_HTTP_TIMEOUT,
+            allow_redirects=True,
+            headers=LINZ_HTTP_HEADERS,
+        )
+        if not response.ok:
+            return None
+        length = response.headers.get("Content-Length")
+        return int(length) if length else None
+    except (TypeError, ValueError, requests.RequestException):
+        return None
+
+
+def iter_download_linz_tile(code):
+    """Download one full Topo50 GeoTIFF into linz_tile_dir(). Yields (fraction, message)."""
+    dest = linz_tile_path(code)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = linz_tile_url(code)
+    part = Path(str(dest) + ".part")
+    expected = _head_linz_tile_size(url)
+    if dest.exists() and dest.stat().st_size > 256:
+        if expected is None or dest.stat().st_size == expected:
+            yield 1.0, f"Using downloaded {code}"
+            return
+        logging.info("Replacing incomplete LINZ tile %s", dest.name)
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+
+    existing = part.stat().st_size if part.exists() else 0
+    headers = dict(LINZ_HTTP_HEADERS)
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+        logging.info("Resuming LINZ tile %s from byte %s", code, existing)
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=LINZ_HTTP_TIMEOUT,
+            headers=headers,
+        ) as response:
+            if existing > 0 and response.status_code == 200:
+                existing = 0
+            elif existing > 0 and response.status_code != 206:
+                response.raise_for_status()
+                existing = 0
+            else:
+                response.raise_for_status()
+            append = existing > 0 and response.status_code == 206
+            total = expected
+            if total is None:
+                length = response.headers.get("Content-Length")
+                if length:
+                    total = existing + int(length) if append else int(length)
+            with open(part, "ab" if append else "wb") as handle:
+                got = existing
+                last_pct = -1
+                for chunk in response.iter_content(LINZ_TILE_CHUNK):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        frac = min(1.0, got / total)
+                        pct = int(frac * 100)
+                        if pct != last_pct:
+                            last_pct = pct
+                            got_mb = got // (1024 * 1024)
+                            total_mb = max(1, total // (1024 * 1024))
+                            yield frac, f"Downloading {code} ({got_mb} / {total_mb} MB)"
+                    else:
+                        yield 0.5, f"Downloading {code} ({got // (1024 * 1024)} MB)"
+    except requests.RequestException as exc:
+        raise HydroScreenError(
+            f"Could not download LINZ tile {code}. "
+            f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
+        ) from exc
+
+    size = part.stat().st_size if part.exists() else 0
+    if expected is not None and size != expected:
+        if size < 1:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        raise HydroScreenError(
+            f"LINZ tile {code} download is incomplete ({size} of {expected} bytes). "
+            "Run again to resume."
+        )
+    if size < 256:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise HydroScreenError(f"LINZ tile {code} download was empty.")
+    part.replace(dest)
+    logging.info("Saved LINZ tile %s (%s bytes) to %s", code, dest.stat().st_size, dest)
+    yield 1.0, f"Saved {code}"
+
+
+def ensure_linz_tiles(codes, progress=None):
+    """Download every intersecting sheet into outputs/linz-tiles/. Returns local paths."""
+    paths = []
+    n = max(1, len(codes))
+    for index, code in enumerate(codes):
+        for frac, message in iter_download_linz_tile(code):
+            _emit_progress(progress, (index + float(frac)) / n, message)
+        paths.append(str(linz_tile_path(code)))
+    return paths
+
+
+def iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
+    """Identify tiles, download full sheets, then clip the 500 m bridge window locally."""
+    yield {"percent": 2, "message": "Finding DEM tiles"}
     plan = plan_linz_clip(lat, lon)
     if not plan["tiles"]:
         raise HydroScreenError(
@@ -372,18 +511,64 @@ def extract_linz_dem_for_bridge(lat, lon, out_tif, progress=None):
             f"({LINZ_LIDAR_1M_LAYER})."
         )
     logging.info(
-        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (%.0f m clip)",
+        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (%.0f m local clip)",
         plan["lat"],
         plan["lon"],
         ", ".join(plan["tiles"]),
         plan["clip_size_m"],
     )
-    path = download_linz_lidar_1m(
-        plan["bbox_4326"],
-        out_tif,
-        bounds_2193=plan["bounds_2193"],
-        progress=progress,
-    )
+    n = len(plan["tiles"])
+    yield {
+        "percent": 5,
+        "message": f"Downloading {', '.join(plan['tiles'])}",
+        "plan": plan,
+    }
+    for index, code in enumerate(plan["tiles"]):
+        for frac, message in iter_download_linz_tile(code):
+            overall = 5 + ((index + max(0.0, min(1.0, float(frac)))) / n) * 80
+            yield {"percent": int(round(overall)), "message": message, "plan": plan}
+    paths = [str(linz_tile_path(code)) for code in plan["tiles"]]
+    yield {"percent": 86, "message": "Clipping DEM to the bridge area", "plan": plan}
+
+    cache_file = _cache_file_for(plan["bbox_4326"], None, bounds_2193=plan["bounds_2193"])
+    out_path = Path(out_tif)
+    with _CACHE_LOCK:
+        if cache_file.exists() and cache_file.stat().st_size > 256:
+            logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
+            if out_path.resolve() != cache_file.resolve():
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cache_file, out_path)
+            yield {
+                "percent": 100,
+                "message": "DEM ready",
+                "path": str(out_path),
+                "plan": plan,
+            }
+            return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    clip_dem_tiles(paths, plan["bounds_2193"], str(out_path))
+    with _CACHE_LOCK:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            if out_path.resolve() != cache_file.resolve():
+                shutil.copyfile(out_path, cache_file)
+            _prune_dem_cache()
+        except OSError as exc:
+            logging.warning("Could not cache LiDAR clip: %s", exc)
+    yield {"percent": 100, "message": "DEM ready", "path": str(out_path), "plan": plan}
+
+
+def extract_linz_dem_for_bridge(lat, lon, out_tif, progress=None):
+    """Download intersecting LINZ sheets, then clip 500 m locally. Returns (path, plan)."""
+    path = None
+    plan = None
+    for event in iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
+        plan = event.get("plan") or plan
+        if progress is not None and "percent" in event:
+            _emit_progress(progress, event["percent"] / 100.0, event.get("message"))
+        if event.get("path"):
+            path = event["path"]
     return path, plan
 
 
@@ -452,24 +637,16 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
 
 
 def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, progress=None):
-    """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif.
+    """Download intersecting LINZ sheets, then clip locally around bbox.
 
     When bounds_2193 is set, the GeoTIFF is clipped to that exact NZTM window
     (used for the 500 m site square) and is not grown for cache snapping.
+    Full sheets are stored under outputs/linz-tiles/; only the clip is cached.
     """
     if bounds_2193 is None:
         bbox = expand_bbox_for_cache(bbox)
     cache_file = _cache_file_for(bbox, resolution, bounds_2193=bounds_2193)
     out_path = Path(out_tif)
-    with _CACHE_LOCK:
-        if cache_file.exists() and cache_file.stat().st_size > 256:
-            logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
-            _emit_progress(progress, 0.7, "Reusing cached DEM")
-            if out_path.resolve() != cache_file.resolve():
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(cache_file, out_path)
-            _emit_progress(progress, 1.0, "DEM ready")
-            return str(out_path)
 
     _emit_progress(progress, 0.04, "Finding DEM tiles")
     codes = linz_tiles_for_bbox(bbox)
@@ -478,6 +655,26 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
             "This site is outside the New Zealand LiDAR 1m DEM coverage "
             f"({LINZ_LIDAR_1M_LAYER})."
         )
+    logging.info(
+        "Downloading New Zealand LiDAR 1m DEM sheets %s, then clipping locally",
+        ", ".join(codes),
+    )
+
+    def on_download(frac, message=None):
+        _emit_progress(progress, 0.05 + 0.75 * float(frac), message)
+
+    local_paths = ensure_linz_tiles(codes, progress=on_download)
+
+    with _CACHE_LOCK:
+        if cache_file.exists() and cache_file.stat().st_size > 256:
+            logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
+            _emit_progress(progress, 0.9, "Reusing cached DEM")
+            if out_path.resolve() != cache_file.resolve():
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cache_file, out_path)
+            _emit_progress(progress, 1.0, "DEM ready")
+            return str(out_path)
+
     if bounds_2193 is not None:
         west, south, east, north = (float(v) for v in bounds_2193)
     else:
@@ -487,17 +684,17 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
         x2, y2 = transformer.transform(maxx, maxy)
         west, east = min(x1, x2) - 2.0, max(x1, x2) + 2.0
         south, north = min(y1, y2) - 2.0, max(y1, y2) + 2.0
-    uris = [f"/vsicurl/{LINZ_LIDAR_1M_BASE}{code}.tiff" for code in codes]
-    logging.info(
-        "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
-        ", ".join(codes),
-    )
+
+    def on_clip(frac, message=None):
+        _emit_progress(progress, 0.82 + 0.18 * float(frac), message)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     clip_dem_tiles(
-        uris,
+        local_paths,
         (west, south, east, north),
-        out_tif,
+        str(out_path),
         resolution=resolution,
-        progress=progress,
+        progress=on_clip,
     )
     with _CACHE_LOCK:
         try:
@@ -579,7 +776,7 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
 def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
     """Yield progress events, then a final overlay result with png/bounds."""
     _ = (along_m, length, buffer)
-    yield {"percent": 0, "message": "Downloading DEM…"}
+    yield {"percent": 0, "message": "Finding DEM tiles"}
     bounds_2193 = square_clip_2193(lat, lon)
     bbox = bbox_4326_from_2193(bounds_2193)
     radius = DEM_CLIP_SIZE_M / 2.0
@@ -589,21 +786,19 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
     linz_tiles = []
     try:
         if src_path is None:
-            yield {"percent": 8, "message": "Finding DEM tiles"}
-            plan = plan_linz_clip(lat, lon)
-            if not plan["tiles"]:
-                raise HydroScreenError(
-                    "This site is outside the New Zealand LiDAR 1m DEM coverage "
-                    f"({LINZ_LIDAR_1M_LAYER})."
-                )
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
-            yield {
-                "percent": 15,
-                "message": f"Downloading DEM from {', '.join(plan['tiles'])}",
-            }
+            plan = None
             try:
-                src_path, plan = extract_linz_dem_for_bridge(lat, lon, src_path)
+                for event in iter_extract_linz_dem_for_bridge(lat, lon, src_path):
+                    yield {
+                        "percent": int(event.get("percent") or 0),
+                        "message": event.get("message") or "Downloading DEM…",
+                    }
+                    if event.get("path"):
+                        src_path = event["path"]
+                    if event.get("plan"):
+                        plan = event["plan"]
             except HydroScreenError:
                 raise
             except Exception as exc:
@@ -613,8 +808,8 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
                     f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
                 ) from exc
             source = "linz-lidar-1m"
-            linz_tiles = plan["tiles"]
-            yield {"percent": 85, "message": "Drawing DEM overlay"}
+            linz_tiles = list((plan or {}).get("tiles") or [])
+            yield {"percent": 92, "message": "Drawing DEM overlay"}
         else:
             yield {"percent": 40, "message": "Reading DEM"}
         png, bounds = render_dem_overlay_png(src_path, bbox)
@@ -1339,13 +1534,13 @@ def run_screening(
                 )
         if dem_path is None:
             logging.info(
-                "Clipping New Zealand LiDAR 1m DEM around the site (%sm × %sm)",
+                "Downloading New Zealand LiDAR 1m DEM around the site, then clipping locally "
+                "(%sm × %sm)",
                 int(DEM_CLIP_SIZE_M),
                 int(DEM_CLIP_SIZE_M),
             )
-            # vsicurl must run on this request thread. Preview already uses
-            # that path; a daemon worker can hang forever after the overlay
-            # is visible. Write into the shared cache so Run reuses it.
+            # Full-tile download and the local 500 m clip stay on this request
+            # thread so Stop can still interrupt between sheets.
             cache_file = _cache_file_for(bbox, None, bounds_2193=bounds_2193)
             try:
                 check_cancelled(cancel_event)
