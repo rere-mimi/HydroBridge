@@ -40,7 +40,7 @@ sudo apt-get install -y --no-install-recommends gdal-bin libgdal-dev libspatiali
 
 ## Web interface
 
-The map UI opens centred on Christchurch. Search or pan to a site, then:
+The map UI opens centred on Christchurch on Google Map. Switch to **Earth** (satellite) or **Topo** (terrain) with the control on the map. Search or pan to a site, then:
 
 ```bash
 .venv/bin/python app.py

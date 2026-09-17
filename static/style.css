@@ -183,11 +183,41 @@ body.mode-xs #map {
   margin-top: 0.7rem;
 }
 
+.basemap-switch {
+  position: fixed;
+  z-index: 910;
+  left: 0.85rem;
+  bottom: 1.6rem;
+  display: flex;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.65);
+  border-radius: 999px;
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow);
+}
+
+.basemap-switch button {
+  margin: 0;
+  padding: 0.4rem 0.85rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.basemap-switch button[aria-pressed="true"] {
+  background: var(--accent);
+  color: white;
+}
+
 .legend {
   position: fixed;
   z-index: 900;
   left: 0.85rem;
-  bottom: 1.6rem;
+  bottom: 4.35rem;
   width: min(18.5rem, calc(100vw - 1.7rem));
   padding: 0.85rem 1rem;
 }
@@ -227,6 +257,8 @@ body.mode-xs #map {
 }
 
 .swatch.basemap { background: linear-gradient(90deg, #dbeafe, #bbf7d0); }
+.swatch.basemap.earth { background: linear-gradient(90deg, #14532d, #65a30d, #fef3c7); }
+.swatch.basemap.topo { background: linear-gradient(90deg, #d6d3d1, #a8a29e, #78716c); }
 .swatch.bridge {
   width: 0.7rem;
   height: 0.7rem;
@@ -557,4 +589,5 @@ th, td {
     max-height: 42vh;
   }
   .legend { display: none; }
+  .basemap-switch { bottom: 0.85rem; }
 }
