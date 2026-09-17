@@ -14,6 +14,7 @@ Usage examples are in README.md
 """
 
 import argparse
+import functools
 import io
 import json
 import os
@@ -60,7 +61,12 @@ LINZ_LIDAR_1M_BASE = (
 LINZ_LIDAR_1M_INDEX = ROOT / "data" / "linz_dem_1m_index.json"
 MAX_DEM_RADIUS_M = 2000.0
 DEM_PREVIEW_MAX_PX = 640
-DEM_PREVIEW_MIN_RADIUS_M = 1500.0
+DEM_PREVIEW_MIN_RADIUS_M = 800.0
+DEM_CACHE_MAX_FILES = 12
+_CACHE_LOCK = threading.Lock()
+_PLOT_LOCK = threading.Lock()
+_PLOT_FIG = None
+_PLOT_AX = None
 
 
 class HydroScreenError(Exception):
@@ -99,13 +105,59 @@ def _run_interruptibly(fn, cancel_event):
         raise box["error"]
     return box.get("value")
 
+
+@functools.lru_cache(maxsize=16)
+def _transformer(src_crs, dst_crs):
+    """Cached pyproj transformer. CRS arguments must be strings."""
+    return Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+
+
+def dem_cache_dir():
+    override = os.environ.get("HYDROBRIDGE_DEM_CACHE")
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "hydrobridge-dem-cache"
+
+
+def expand_bbox_for_cache(bbox, step=0.005):
+    """Snap a lon/lat bbox outward so nearby requests share one LiDAR clip."""
+    minx, miny, maxx, maxy = (float(v) for v in bbox)
+    inv = round(1.0 / float(step))
+
+    def snap_down(value):
+        return math.floor(value * inv + 1e-9) / inv
+
+    def snap_up(value):
+        return math.ceil(value * inv - 1e-9) / inv
+
+    return (snap_down(minx), snap_down(miny), snap_up(maxx), snap_up(maxy))
+
+
+def _cache_file_for(bbox, resolution):
+    minx, miny, maxx, maxy = expand_bbox_for_cache(bbox)
+    res = 0 if resolution is None else round(float(resolution), 2)
+    name = f"{minx:.5f}_{miny:.5f}_{maxx:.5f}_{maxy:.5f}_{res:g}.tif"
+    return dem_cache_dir() / name
+
+
+def _prune_dem_cache():
+    folder = dem_cache_dir()
+    if not folder.exists():
+        return
+    files = sorted(folder.glob("*.tif"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in files[DEM_CACHE_MAX_FILES:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
 # Utilities
 
 def bbox_from_point(lat, lon, buffer_m):
     """Return bbox (minLon, minLat, maxLon, maxLat) in EPSG:4326 by buffering in meters using WebMercator."""
-    # Project to WebMercator for metric buffer
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
     x, y = transformer_to_3857.transform(lon, lat)
     minx = x - buffer_m
     maxx = x + buffer_m
@@ -175,7 +227,7 @@ def _raster_covers_bbox(dem_path, bbox):
     """Check if the raster at dem_path fully covers bbox (minLon,minLat,maxLon,maxLat)"""
     try:
         with rasterio.open(dem_path) as src:
-            transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            transformer = _transformer("EPSG:4326", str(src.crs))
             minx, miny, maxx, maxy = bbox
             x1, y1 = transformer.transform(minx, miny)
             x2, y2 = transformer.transform(maxx, maxy)
@@ -194,6 +246,15 @@ def _configure_gdal_http():
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "4")
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
+    os.environ.setdefault("GDAL_HTTP_MULTIPLEX", "YES")
+    os.environ.setdefault("GDAL_HTTP_VERSION", "2")
+    os.environ.setdefault("GDAL_CACHEMAX", "256")
+    os.environ.setdefault("GDAL_INGESTED_BYTES_AT_OPEN", "65536")
+    os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF,.TIFF")
+    os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
+    os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
+    os.environ.setdefault("VSI_CACHE", "TRUE")
+    os.environ.setdefault("VSI_CACHE_SIZE", "67108864")
 
 
 def load_linz_dem_1m_index():
@@ -256,7 +317,6 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
             "crs": datasets[0].crs or "EPSG:2193",
             "transform": transform,
             "nodata": nodata,
-            "compress": "deflate",
             "tiled": True,
             "blockxsize": 256,
             "blockysize": 256,
@@ -271,13 +331,24 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
 
 def download_linz_lidar_1m(bbox, out_tif, resolution=None):
     """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif."""
+    bbox = expand_bbox_for_cache(bbox)
+    cache_file = _cache_file_for(bbox, resolution)
+    out_path = Path(out_tif)
+    with _CACHE_LOCK:
+        if cache_file.exists() and cache_file.stat().st_size > 256:
+            logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
+            if out_path.resolve() != cache_file.resolve():
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cache_file, out_path)
+            return str(out_path)
+
     codes = linz_tiles_for_bbox(bbox)
     if not codes:
         raise HydroScreenError(
             "This site is outside the New Zealand LiDAR 1m DEM coverage "
             f"({LINZ_LIDAR_1M_LAYER})."
         )
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:2193", always_xy=True)
+    transformer = _transformer("EPSG:4326", "EPSG:2193")
     minx, miny, maxx, maxy = bbox
     x1, y1 = transformer.transform(minx, miny)
     x2, y2 = transformer.transform(maxx, maxy)
@@ -288,7 +359,16 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None):
         "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
         ", ".join(codes),
     )
-    return clip_dem_tiles(uris, (west, south, east, north), out_tif, resolution=resolution)
+    clip_dem_tiles(uris, (west, south, east, north), out_tif, resolution=resolution)
+    with _CACHE_LOCK:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            if out_path.resolve() != cache_file.resolve():
+                shutil.copyfile(out_path, cache_file)
+            _prune_dem_cache()
+        except OSError as exc:
+            logging.warning("Could not cache LiDAR clip: %s", exc)
+    return str(out_path)
 
 
 def screening_dem_radius_m(buffer, along_m, length):
@@ -353,7 +433,7 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
         )
     rgba = _colorize_elevation(dest)
     buf = io.BytesIO()
-    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=False)
     return buf.getvalue(), (west, south, east, north)
 
 
@@ -386,8 +466,8 @@ def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, bu
 
 def centerline_reach(centerline, lon, lat, along_m):
     """Return the centreline segment around the bridge, length along_m."""
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
     proj_line = LineString([transformer_to_3857.transform(x, y) for x, y in centerline.coords])
     if proj_line.length <= 0:
         return centerline
@@ -409,8 +489,8 @@ def centerline_reach(centerline, lon, lat, along_m):
 
 def bbox_from_transects(lon, lat, transects, pad_m=50.0):
     """Geographic bbox covering the pin and transects, capped around the pin."""
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
     px, py = transformer_to_3857.transform(lon, lat)
     xs = [px]
     ys = [py]
@@ -439,8 +519,8 @@ def bbox_from_lonlat_points(points, pad_m=80.0):
     """Geographic bbox covering lon/lat points, padded in metres."""
     if not points:
         raise HydroScreenError("Need coordinates to clip the DEM.")
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
     xs = []
     ys = []
     for lon, lat in points:
@@ -520,8 +600,8 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
         raise HydroScreenError("Transect length must be greater than 0.")
 
     # Work in WebMercator for metric distances
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
 
     # Project centerline to 3857
     proj_coords = [transformer_to_3857.transform(x, y) for (x, y) in centerline.coords]
@@ -588,13 +668,14 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
 
 # Sample DEM along a LineString
 
-def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=None):
+def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=None, src=None):
     """Sample DEM elevations at regular metric spacing along a lon/lat line.
 
-    Returns (distances_m, elevations, sample_lonlat).
+    Returns (distances_m, elevations, sample_lonlat). Pass an open rasterio
+    dataset as `src` to avoid reopening the file for every transect.
     """
-    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    transformer_to_4326 = _transformer("EPSG:3857", "EPSG:4326")
     proj_line = LineString([transformer_to_3857.transform(x, y) for x, y in line.coords])
     length = float(proj_line.length)
     if length <= 0:
@@ -612,23 +693,31 @@ def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=N
         count = max(2, int(n_points or 201))
         distances = list(np.linspace(0.0, length, count))
 
-    coords = []
-    for dist in distances:
-        pt = proj_line.interpolate(dist)
-        lon, lat = transformer_to_4326.transform(pt.x, pt.y)
-        coords.append((lon, lat))
+    xs = np.array([proj_line.interpolate(dist).x for dist in distances])
+    ys = np.array([proj_line.interpolate(dist).y for dist in distances])
+    lons, lats = transformer_to_4326.transform(xs, ys)
+    coords = list(zip(map(float, np.atleast_1d(lons)), map(float, np.atleast_1d(lats))))
 
-    with rasterio.open(dem_path) as src:
-        transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-        coords_raster = [transformer.transform(x, y) for x, y in coords]
+    close_src = False
+    if src is None:
+        src = rasterio.open(dem_path)
+        close_src = True
+    try:
+        transformer = _transformer("EPSG:4326", str(src.crs))
+        rx, ry = transformer.transform(lons, lats)
+        coords_raster = list(zip(np.atleast_1d(rx), np.atleast_1d(ry)))
         elevations = []
+        nodata = src.nodata
         for val in src.sample(coords_raster):
             v = val[0]
-            if src.nodata is not None and (v == src.nodata or np.isnan(v)):
+            if nodata is not None and (v == nodata or np.isnan(v)):
                 elevations.append(np.nan)
             else:
                 elevations.append(float(v))
         return np.array(distances), np.array(elevations), coords
+    finally:
+        if close_src:
+            src.close()
 
 
 MAX_XS_LENGTH_M = 2000.0
@@ -827,9 +916,9 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, c
     }
 
 
-def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0):
+def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0, src=None):
     """Bed slope along the river centreline from DEM samples, as |dz/ds|."""
-    dists, elevs, _ = sample_dem_along_line(dem_path, centerline, spacing_m=spacing_m)
+    dists, elevs, _ = sample_dem_along_line(dem_path, centerline, spacing_m=spacing_m, src=src)
     mask = np.isfinite(elevs)
     if mask.sum() < 2:
         return None
@@ -842,24 +931,28 @@ def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0):
 
 
 def plot_cross_section(dists, elevs, out_png, water_level=None):
-    plt.figure(figsize=(8, 4))
-    plt.plot(dists, elevs, '-k', label='Ground')
-    finite = elevs[np.isfinite(elevs)]
-    y_floor = (np.min(finite) - 1) if len(finite) else -1
-    if water_level is not None and np.isfinite(water_level):
-        wet = np.isfinite(elevs) & (elevs < water_level)
-        plt.fill_between(dists, elevs, water_level, where=wet, color='#4ea3c9', alpha=0.55, interpolate=True)
-        plt.axhline(water_level, color='#1f6f8b', linestyle='--', linewidth=1.2, label='Water level')
-        plt.legend(loc='best', frameon=False)
-    else:
-        plt.fill_between(dists, elevs, y_floor, color='lightblue')
-    plt.xlabel('Distance (m)')
-    plt.ylabel('Elevation (m)')
-    plt.title('Cross-section')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_png)
-    plt.close()
+    global _PLOT_FIG, _PLOT_AX
+    with _PLOT_LOCK:
+        if _PLOT_FIG is None or _PLOT_AX is None:
+            _PLOT_FIG, _PLOT_AX = plt.subplots(figsize=(7.2, 3.4), dpi=90)
+        ax = _PLOT_AX
+        ax.clear()
+        ax.plot(dists, elevs, "-k", label="Ground")
+        finite = elevs[np.isfinite(elevs)]
+        y_floor = (np.min(finite) - 1) if len(finite) else -1
+        if water_level is not None and np.isfinite(water_level):
+            wet = np.isfinite(elevs) & (elevs < water_level)
+            ax.fill_between(dists, elevs, water_level, where=wet, color="#4ea3c9", alpha=0.55, interpolate=True)
+            ax.axhline(water_level, color="#1f6f8b", linestyle="--", linewidth=1.2, label="Water level")
+            ax.legend(loc="best", frameon=False)
+        else:
+            ax.fill_between(dists, elevs, y_floor, color="lightblue")
+        ax.set_xlabel("Distance (m)")
+        ax.set_ylabel("Elevation (m)")
+        ax.set_title("Cross-section")
+        ax.grid(True)
+        _PLOT_FIG.tight_layout()
+        _PLOT_FIG.savefig(out_png, dpi=90)
 
 
 DATA_SHEET_COLUMNS = ["ID", "Transect ID", "Distance_m", "Elevation_m"]
@@ -904,7 +997,7 @@ def centerline_from_coords(coords):
 
 def projected_length_m(line: LineString) -> float:
     """Length of a lon/lat line in metres (Web Mercator)."""
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer = _transformer("EPSG:4326", "EPSG:3857")
     proj = LineString([transformer.transform(x, y) for x, y in line.coords])
     return float(proj.length)
 
@@ -1037,73 +1130,77 @@ def run_screening(
         reach = centerline
     else:
         reach = centerline_reach(centerline, lon, lat, along_m)
-    slope = estimate_centerline_slope(dem_path, reach, spacing_m=max(sample_spacing, 5.0))
-    if slope is None:
-        raise HydroScreenError(
-            "Could not estimate river slope from the centreline DEM samples. "
-            "Draw the river through the bridge pin so it sits on the LiDAR window."
-        )
-    logging.info("Estimated centreline slope S=%.6f", slope)
 
     summary = []
     data_rows = []
     transect_features = []
     point_id = 1
-    for i, (tran, offset) in enumerate(transects):
-        check_cancelled(cancel_event)
-        dists, elevs, sample_coords = sample_dem_along_line(
-            dem_path, tran, spacing_m=sample_spacing
+    with rasterio.open(dem_path) as dem_src:
+        slope = estimate_centerline_slope(
+            dem_path, reach, spacing_m=max(sample_spacing, 5.0), src=dem_src
         )
-        stats = solve_water_level(
-            dists,
-            elevs,
-            flow_m3_s=flow_m3_s,
-            mannings_n=mannings_n,
-            slope=slope,
-            cancel_event=cancel_event,
-        )
-        df = pd.DataFrame({
-            "distance_m": dists,
-            "longitude": [xy[0] for xy in sample_coords],
-            "latitude": [xy[1] for xy in sample_coords],
-            "elevation_m": elevs,
-        })
-        csv_path = outdir / f"transect_{i+1}.csv"
-        df.to_csv(csv_path, index=False)
-        png_path = outdir / f"transect_{i+1}.png"
-        plot_cross_section(dists, elevs, png_path, water_level=stats.get("water_level_m"))
-        stats.update({
-            "transect": i + 1,
-            "offset_m": float(offset),
-            "n_samples": int(len(dists)),
-            "sample_spacing_m": float(sample_spacing),
-            "csv": str(csv_path),
-            "plot": str(png_path),
-        })
-        summary.append(stats)
-        for dist, elev in zip(dists, elevs):
-            data_rows.append({
-                "ID": point_id,
-                "Transect ID": i + 1,
-                "Distance_m": float(dist),
-                "Elevation_m": float(elev) if np.isfinite(elev) else np.nan,
+        if slope is None:
+            raise HydroScreenError(
+                "Could not estimate river slope from the centreline DEM samples. "
+                "Draw the river through the bridge pin so it sits on the LiDAR window."
+            )
+        logging.info("Estimated centreline slope S=%.6f", slope)
+
+        for i, (tran, offset) in enumerate(transects):
+            check_cancelled(cancel_event)
+            dists, elevs, sample_coords = sample_dem_along_line(
+                dem_path, tran, spacing_m=sample_spacing, src=dem_src
+            )
+            stats = solve_water_level(
+                dists,
+                elevs,
+                flow_m3_s=flow_m3_s,
+                mannings_n=mannings_n,
+                slope=slope,
+                cancel_event=cancel_event,
+            )
+            df = pd.DataFrame({
+                "distance_m": dists,
+                "longitude": [xy[0] for xy in sample_coords],
+                "latitude": [xy[1] for xy in sample_coords],
+                "elevation_m": elevs,
             })
-            point_id += 1
-        sample_preview = sample_coords
-        if len(sample_preview) > 80:
-            step = max(1, len(sample_preview) // 80)
-            sample_preview = sample_preview[::step]
-            if sample_preview[-1] != sample_coords[-1]:
-                sample_preview.append(sample_coords[-1])
-        transect_features.append({
-            "transect": i + 1,
-            "offset_m": float(offset),
-            "coords": [[x, y] for x, y in tran.coords],
-            "samples": [[x, y] for x, y in sample_preview],
-            "n_samples": int(len(dists)),
-            "csv": csv_path.name,
-            "plot": png_path.name,
-        })
+            csv_path = outdir / f"transect_{i+1}.csv"
+            df.to_csv(csv_path, index=False)
+            png_path = outdir / f"transect_{i+1}.png"
+            plot_cross_section(dists, elevs, png_path, water_level=stats.get("water_level_m"))
+            stats.update({
+                "transect": i + 1,
+                "offset_m": float(offset),
+                "n_samples": int(len(dists)),
+                "sample_spacing_m": float(sample_spacing),
+                "csv": str(csv_path),
+                "plot": str(png_path),
+            })
+            summary.append(stats)
+            for dist, elev in zip(dists, elevs):
+                data_rows.append({
+                    "ID": point_id,
+                    "Transect ID": i + 1,
+                    "Distance_m": float(dist),
+                    "Elevation_m": float(elev) if np.isfinite(elev) else np.nan,
+                })
+                point_id += 1
+            sample_preview = sample_coords
+            if len(sample_preview) > 80:
+                step = max(1, len(sample_preview) // 80)
+                sample_preview = sample_preview[::step]
+                if sample_preview[-1] != sample_coords[-1]:
+                    sample_preview.append(sample_coords[-1])
+            transect_features.append({
+                "transect": i + 1,
+                "offset_m": float(offset),
+                "coords": [[x, y] for x, y in tran.coords],
+                "samples": [[x, y] for x, y in sample_preview],
+                "n_samples": int(len(dists)),
+                "csv": csv_path.name,
+                "plot": png_path.name,
+            })
 
     check_cancelled(cancel_event)
     summary_path = outdir / "summary.xlsx"
