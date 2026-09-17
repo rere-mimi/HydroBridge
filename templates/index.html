@@ -26,6 +26,11 @@
     </form>
   </header>
 
+  <div id="busy" class="busy" hidden role="status" aria-live="polite">
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="busy-text">Working…</span>
+  </div>
+
   <aside id="coach" class="card coach" aria-live="polite">
     <p id="map-hint" class="coach-copy">Navigate the map, then double-click a bridge to drop a pin.</p>
     <p id="status" class="status" role="status"></p>
@@ -228,6 +233,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=tool-clicks"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=busy-spinner"></script>
 </body>
 </html>

@@ -17,7 +17,8 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="mode-xs"', html)
         self.assertIn('id="run-status"', html)
         self.assertIn("novalidate", html)
-        self.assertIn("tool-clicks", html)
+        self.assertIn('id="busy"', html)
+        self.assertIn("busy-spinner", html)
         self.assertNotIn("disabled>Run screening", html)
 
     def test_cross_section_api_still_accepts_two_points(self):

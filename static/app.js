@@ -37,6 +37,8 @@ const nameCoords = document.getElementById("name-coords");
 const xsViewer = document.getElementById("xs-viewer");
 const xsMeta = document.getElementById("xs-meta");
 const xsCanvas = document.getElementById("xs-canvas");
+const busyEl = document.getElementById("busy");
+const busyText = document.getElementById("busy-text");
 
 const map = L.map("map", { doubleClickZoom: false }).setView(
   [CHRISTCHURCH.lat, CHRISTCHURCH.lon],
@@ -148,6 +150,23 @@ let runJobId = null;
 let runBusy = false;
 let runReady = false;
 let runBlockReason = "Double-click the map to pin a bridge, then draw the river.";
+let busyCount = 0;
+let lastPreviewKey = "";
+
+function setBusy(on, label) {
+  if (on) {
+    busyCount += 1;
+    if (label && busyText) busyText.textContent = label;
+    if (busyEl) busyEl.hidden = false;
+    document.body.classList.add("is-busy");
+  } else {
+    busyCount = Math.max(0, busyCount - 1);
+    if (busyCount === 0) {
+      if (busyEl) busyEl.hidden = true;
+      document.body.classList.remove("is-busy");
+    }
+  }
+}
 
 function setStatus(message, kind) {
   const text = message || "";
@@ -164,10 +183,20 @@ function setRunAvailability() {
   runBtn.disabled = runBusy;
   runBtn.setAttribute("aria-disabled", runBusy || !runReady ? "true" : "false");
   runBtn.classList.toggle("is-disabled", runBusy || !runReady);
-  runBtn.textContent = runBusy ? "Running…" : "Run screening";
+  runBtn.replaceChildren();
+  if (runBusy) {
+    const spin = document.createElement("span");
+    spin.className = "spinner spinner-btn";
+    spin.setAttribute("aria-hidden", "true");
+    runBtn.append(spin, document.createTextNode(" Running…"));
+  } else {
+    runBtn.textContent = "Run screening";
+  }
 }
 
 function setRunning(running) {
+  if (running && !runBusy) setBusy(true, "Running screening…");
+  if (!running && runBusy) setBusy(false);
   runBusy = running;
   stopBtn.hidden = !running;
   stopBtn.disabled = !running;
@@ -329,20 +358,24 @@ function clearDemOverlay() {
 
 function scheduleDemPreview() {
   clearTimeout(demPreviewTimer);
-  demPreviewTimer = setTimeout(refreshDemOverlay, 400);
+  demPreviewTimer = setTimeout(refreshDemOverlay, 700);
 }
 
 async function refreshDemOverlay() {
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
   const source = currentDemSource();
-  if (source === "upload") {
-    const file = document.getElementById("dem-file");
-    if (!file || !file.files || !file.files[0]) {
-      clearDemOverlay();
-      return;
-    }
+  const upload = document.getElementById("dem-file");
+  const uploadName = source === "upload" && upload && upload.files && upload.files[0]
+    ? upload.files[0].name + upload.files[0].size
+    : "";
+  if (source === "upload" && !uploadName) {
+    clearDemOverlay();
+    lastPreviewKey = "";
+    return;
   }
+  const key = [lat.toFixed(5), lon.toFixed(5), source, alongInput.value || "300", runForm.length.value, uploadName].join("|");
+  if (key === lastPreviewKey && demOverlay) return;
   const seq = (demPreviewSeq += 1);
   const body = new FormData();
   body.set("lat", String(lat));
@@ -351,14 +384,16 @@ async function refreshDemOverlay() {
   body.set("along", alongInput.value || "300");
   body.set("length", runForm.length.value);
   if (source === "upload") {
-    body.set("dem", document.getElementById("dem-file").files[0]);
+    body.set("dem", upload.files[0]);
   }
+  setBusy(true, "Loading DEM…");
   try {
     const res = await fetch("/api/dem-preview", { method: "POST", body });
     const data = await res.json();
     if (seq !== demPreviewSeq) return;
     if (!res.ok || !data.png || !data.bounds) {
       clearDemOverlay();
+      lastPreviewKey = "";
       return;
     }
     const bytes = Uint8Array.from(atob(data.png), (ch) => ch.charCodeAt(0));
@@ -370,10 +405,14 @@ async function refreshDemOverlay() {
       interactive: false,
       className: "dem-overlay",
     }).addTo(map);
+    lastPreviewKey = key;
     refreshLegend();
   } catch (_err) {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
+    lastPreviewKey = "";
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -618,6 +657,7 @@ async function requestXsProfile(start, end) {
   }
   setXsMeta("Sampling the DEM…");
   showXsViewer();
+  setBusy(true, "Sampling DEM…");
   try {
     const res = await fetch("/api/cross-section", { method: "POST", body });
     const data = await res.json();
@@ -639,6 +679,8 @@ async function requestXsProfile(start, end) {
     if (seq !== xsRequestSeq) return;
     setStatus("Could not reach the HydroBridge server.", "error");
     setXsMeta("Could not sample the DEM.");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -973,6 +1015,7 @@ searchForm.addEventListener("submit", async (event) => {
   hideSearchResults();
   if (query.length < 2) return;
   setStatus("Searching…");
+  setBusy(true, "Searching…");
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
     const data = await res.json();
@@ -1001,6 +1044,8 @@ searchForm.addEventListener("submit", async (event) => {
     searchResults.hidden = false;
   } catch (_err) {
     setStatus("Place search is unavailable.", "error");
+  } finally {
+    setBusy(false);
   }
 });
 
