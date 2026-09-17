@@ -40,16 +40,20 @@ sudo apt-get install -y --no-install-recommends gdal-bin libgdal-dev libspatiali
 
 ## Web interface
 
-The easiest way to choose a bridge site is the map UI: click the map, search for a place, or type latitude/longitude.
+The map UI opens centred on Christchurch. Search or pan to a site, then:
 
 ```bash
 .venv/bin/python app.py
 ```
 
-Then open http://127.0.0.1:5050. Place the bridge pin, then click **Draw river** and sketch the channel. In **Transects and sampling**, set:
+Open http://127.0.0.1:5050.
+
+1. Double-click a bridge and name the pin.
+2. Draw the river centreline through the pin (click along the channel, double-click to finish). The drawn length is the analysis reach.
+3. Set hydrology in the panel that appears. Each parameter has a **?** with its definition:
 
 - **Transect length** — width of each cross-section, centred on the river
-- **Length along river** and **Transect spacing** — how far along the centreline to cover and how often to cut a cross-section
+- **Transect spacing** — distance between cross-sections along the centreline
 - **Sample spacing** — distance between DEM sample points on each transect
 - **Flow rate Q** and **Manning’s n** — water level is raised on each transect until Manning’s equation matches that flow; slope is estimated from the centreline
 
