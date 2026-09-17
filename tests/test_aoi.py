@@ -13,15 +13,20 @@ from rasterio.transform import from_origin
 from shapely.geometry import Polygon
 
 from hydroscreen import (
+    DEM_MAX_PIXELS,
     HydroScreenError,
     aoi_downstream_unit_2193,
+    aoi_native_pixels,
     aoi_polygon_2193,
     bridge_aoi,
     clip_dem_tiles,
     extract_linz_dem_for_bridge,
+    iter_dem_preview,
+    iter_extract_linz_dem_for_bridge,
     linz_window_uris,
     parse_aoi_extent,
     plan_linz_clip,
+    preview_resolution_m,
     square_clip_2193,
 )
 
@@ -98,6 +103,35 @@ class AoiGeometryTests(unittest.TestCase):
         with self.assertRaises(HydroScreenError):
             parse_aoi_extent("wide", name="Lateral extent")
 
+    def test_1500_by_1000_window_is_within_the_limit(self):
+        self.assertEqual(parse_aoi_extent(750), 750.0)
+        self.assertEqual(parse_aoi_extent(500), 500.0)
+        self.assertEqual(parse_aoi_extent(5000), 5000.0)
+        aoi = bridge_aoi(*WELLINGTON, upstream_m=750, downstream_m=750, lateral_m=500)
+        self.assertAlmostEqual(aoi["along_m"], 1500.0, places=5)
+        self.assertAlmostEqual(aoi["width_m"], 1000.0, places=5)
+        self.assertLess(aoi_native_pixels(aoi["along_m"], aoi["width_m"]), DEM_MAX_PIXELS)
+        self.assertGreaterEqual(preview_resolution_m(1500, 1000), 2.0)
+
+    def test_rejects_a_1m_clip_that_exceeds_the_pixel_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "HYDROBRIDGE_DEM_CACHE": str(Path(tmp) / "cache"),
+                "HYDROBRIDGE_LINZ_TILES": str(Path(tmp) / "linz-tiles"),
+            }
+            with patch.dict(os.environ, env):
+                with self.assertRaises(HydroScreenError) as ctx:
+                    list(
+                        iter_extract_linz_dem_for_bridge(
+                            *WELLINGTON,
+                            str(Path(tmp) / "huge.tif"),
+                            upstream_m=5000,
+                            downstream_m=5000,
+                            lateral_m=5000,
+                        )
+                    )
+        self.assertIn("too large", str(ctx.exception).lower())
+
 
 class AoiPlanTests(unittest.TestCase):
     def test_plan_includes_the_aoi_polygon_and_https_urls(self):
@@ -123,6 +157,7 @@ class WindowedExtractTests(unittest.TestCase):
             seen["uris"] = list(uris)
             seen["bounds"] = bounds
             seen["geometry"] = geometry
+            seen["resolution"] = resolution
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
             Path(out_tif).write_bytes(b"AOI-CLIP" * 40)
             return out_tif
@@ -145,6 +180,39 @@ class WindowedExtractTests(unittest.TestCase):
         self.assertIsInstance(seen["geometry"], Polygon)
         self.assertAlmostEqual(seen["geometry"].area, 500.0 * 500.0, delta=1.0)
         self.assertFalse(any(Path(p).exists() for p in used["paths"]))
+        self.assertIsNone(seen.get("resolution"))
+
+    def test_preview_of_a_1500_by_1000_window_uses_coarser_cells(self):
+        seen = {}
+
+        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None, geometry=None):
+            seen["resolution"] = resolution
+            Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_tif).write_bytes(b"AOI-CLIP" * 40)
+            return out_tif
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "HYDROBRIDGE_DEM_CACHE": str(Path(tmp) / "cache"),
+                "HYDROBRIDGE_LINZ_TILES": str(Path(tmp) / "linz-tiles"),
+            }
+            with patch.dict(os.environ, env):
+                with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
+                    with patch(
+                        "hydroscreen.render_dem_overlay_png",
+                        return_value=(b"png", (174.76, -41.30, 174.79, -41.27)),
+                    ):
+                        events = list(
+                            iter_dem_preview(
+                                *WELLINGTON,
+                                upstream_m=750,
+                                downstream_m=750,
+                                lateral_m=500,
+                            )
+                        )
+        self.assertTrue(any(event.get("done") for event in events))
+        self.assertIsNotNone(seen.get("resolution"))
+        self.assertGreaterEqual(seen["resolution"], 2.0)
 
     def test_extract_reuses_a_local_sheet_if_already_on_disk(self):
         seen = {}

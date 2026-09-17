@@ -43,6 +43,8 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('name="upstream"', html)
         self.assertIn('name="downstream"', html)
         self.assertIn('name="lateral"', html)
+        self.assertIn('id="aoi-size"', html)
+        self.assertIn("5,000 m", html)
         self.assertIn("area of interest", html)
         self.assertIn("busy-spinner", html)
         self.assertIn("xs-measure", html)
