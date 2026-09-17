@@ -163,8 +163,8 @@ let lastPreviewKey = "";
 let demTiles = [];
 let demProgressOn = false;
 let demTransparency = 50;
-let lastRun = null;
-let selectedSection = null;
+var lastRun = null;
+var selectedSection = null;
 try {
   const savedTransparency = localStorage.getItem("hydroscreen-dem-transparency");
   if (savedTransparency != null && savedTransparency !== "") {
