@@ -207,6 +207,7 @@ map.getPane("demPane").style.zIndex = 350;
 map.getPane("demPane").style.pointerEvents = "none";
 
 const overlay = L.layerGroup().addTo(map);
+const aoiLayer = L.layerGroup().addTo(map);
 const draftLine = L.polyline([], {
   color: "#0369a1",
   weight: 5,
@@ -252,6 +253,7 @@ let runBlockReason = "Double-click the map to pin a bridge, then draw the river.
 let busyCount = 0;
 let lastPreviewKey = "";
 let demTiles = [];
+let aoiFromServer = null;
 let demProgressOn = false;
 let demTransparency = 50;
 var lastRun = null;
@@ -401,6 +403,123 @@ function closeHelp() {
   });
 }
 
+function aoiExtents() {
+  const up = Number(runForm.upstream && runForm.upstream.value);
+  const down = Number(runForm.downstream && runForm.downstream.value);
+  const side = Number(runForm.lateral && runForm.lateral.value);
+  return {
+    upstream: Number.isFinite(up) && up >= 10 ? up : 250,
+    downstream: Number.isFinite(down) && down >= 10 ? down : 250,
+    lateral: Number.isFinite(side) && side >= 10 ? side : 250,
+  };
+}
+
+function offsetLatLng(origin, eastM, northM) {
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos((origin.lat * Math.PI) / 180);
+  return L.latLng(
+    origin.lat + northM / mPerDegLat,
+    origin.lng + eastM / Math.max(mPerDegLon, 1e-9)
+  );
+}
+
+function aoiDownstreamUnit(pin) {
+  if (drawnLatLngs.length < 2) return { east: 0, north: -1 };
+  let best = null;
+  for (let i = 0; i < drawnLatLngs.length - 1; i += 1) {
+    const a = drawnLatLngs[i];
+    const b = drawnLatLngs[i + 1];
+    const dx = b.lng - a.lng;
+    const dy = b.lat - a.lat;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-18) continue;
+    let t = ((pin.lng - a.lng) * dx + (pin.lat - a.lat) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const px = a.lng + t * dx;
+    const py = a.lat + t * dy;
+    const dist2 = (px - pin.lng) ** 2 + (py - pin.lat) ** 2;
+    if (!best || dist2 < best.dist2) {
+      const east = (b.lng - a.lng) * Math.cos((pin.lat * Math.PI) / 180);
+      const north = b.lat - a.lat;
+      best = { dist2, east, north };
+    }
+  }
+  if (!best) return { east: 0, north: -1 };
+  const mag = Math.hypot(best.east, best.north);
+  if (mag < 1e-12) return { east: 0, north: -1 };
+  return { east: best.east / mag, north: best.north / mag };
+}
+
+function localAoiGeometry(pin) {
+  const { upstream, downstream, lateral } = aoiExtents();
+  const down = aoiDownstreamUnit(pin);
+  const right = { east: down.north, north: -down.east };
+  const add = (eastM, northM) => offsetLatLng(pin, eastM, northM);
+  const ul = add(-down.east * upstream - right.east * lateral, -down.north * upstream - right.north * lateral);
+  const ur = add(-down.east * upstream + right.east * lateral, -down.north * upstream + right.north * lateral);
+  const dr = add(down.east * downstream + right.east * lateral, down.north * downstream + right.north * lateral);
+  const dl = add(down.east * downstream - right.east * lateral, down.north * downstream - right.north * lateral);
+  return {
+    ring: [ul, ur, dr, dl, ul],
+    points: {
+      upstream: add(-down.east * upstream, -down.north * upstream),
+      downstream: add(down.east * downstream, down.north * downstream),
+      left: add(-right.east * lateral, -right.north * lateral),
+      right: add(right.east * lateral, right.north * lateral),
+    },
+  };
+}
+
+function redrawAoi(serverAoi) {
+  aoiLayer.clearLayers();
+  if (!marker) return;
+  const pin = marker.getLatLng();
+  let ring;
+  let points;
+  if (serverAoi && Array.isArray(serverAoi.ring) && serverAoi.ring.length >= 4) {
+    ring = serverAoi.ring.map((pt) => L.latLng(pt[0], pt[1]));
+    points = {};
+    Object.entries(serverAoi.points || {}).forEach(([name, pt]) => {
+      points[name] = L.latLng(pt[0], pt[1]);
+    });
+  } else {
+    const geom = localAoiGeometry(pin);
+    ring = geom.ring;
+    points = geom.points;
+  }
+  L.polygon(ring, {
+    color: "#d97706",
+    weight: 2,
+    fillColor: "#f59e0b",
+    fillOpacity: 0.08,
+    interactive: false,
+  }).addTo(aoiLayer);
+  const labels = { upstream: "U", downstream: "D", left: "L", right: "R" };
+  Object.entries(labels).forEach(([key, text]) => {
+    const ll = points[key];
+    if (!ll) return;
+    L.marker(ll, {
+      interactive: false,
+      keyboard: false,
+      icon: L.divIcon({
+        className: "aoi-label",
+        html: text,
+        iconSize: [18, 18],
+        iconAnchor: [9, 9],
+      }),
+    }).addTo(aoiLayer);
+  });
+}
+
+function appendAoiFields(body) {
+  const ext = aoiExtents();
+  body.set("upstream", String(ext.upstream));
+  body.set("downstream", String(ext.downstream));
+  body.set("lateral", String(ext.lateral));
+  const drawn = centerlinePayload();
+  if (drawn) body.set("centerline", JSON.stringify(drawn));
+}
+
 function setLegend(items) {
   legendList.innerHTML = "";
   items.forEach((item) => {
@@ -423,11 +542,18 @@ function refreshLegend() {
   } else if (drawnLatLngs.length === 1) {
     items.push({ swatch: "river", label: "River centreline (drawing…)" });
   }
+  if (marker) {
+    const ext = aoiExtents();
+    items.push({
+      swatch: "aoi",
+      label: `DEM area of interest — ${ext.upstream} m up, ${ext.downstream} m down, ${ext.lateral} m each side`,
+    });
+  }
   if (demOverlay) {
     const sheets = demTiles.length ? ` · ${demTiles.join(", ")}` : "";
     items.push({
       swatch: "dem",
-      label: `LiDAR DEM 500 m${sheets} (${Math.round(demTransparency)}% transparent)`,
+      label: `LiDAR DEM crop${sheets} (${Math.round(demTransparency)}% transparent)`,
     });
   }
   if (ranTransects) {
@@ -517,7 +643,8 @@ function syncChrome() {
   const lineReady = drawnLatLngs.length >= 2;
   coachActions.hidden = !drawing;
   toolActions.hidden = drawing || !hasPin;
-  runForm.hidden = !lineReady;
+  runForm.hidden = !hasPin;
+  redrawAoi(aoiFromServer);
   undoBtn.disabled = drawnLatLngs.length === 0;
   clearBtn.disabled = drawnLatLngs.length === 0;
   finishBtn.disabled = drawnLatLngs.length < 2;
@@ -545,6 +672,7 @@ function clearDemOverlay() {
     demTilesEl.hidden = true;
     demTilesEl.textContent = "";
   }
+  aoiFromServer = null;
   refreshLegend();
 }
 
@@ -591,7 +719,18 @@ async function readPreviewStream(res) {
 async function refreshDemOverlay() {
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
-  const key = [lat.toFixed(5), lon.toFixed(5), alongInput.value || "300", runForm.length.value].join("|");
+  const ext = aoiExtents();
+  const drawnKey = drawnLatLngs.length >= 2
+    ? drawnLatLngs.map((ll) => `${ll.lat.toFixed(5)},${ll.lng.toFixed(5)}`).join(";")
+    : "";
+  const key = [
+    lat.toFixed(5),
+    lon.toFixed(5),
+    ext.upstream,
+    ext.downstream,
+    ext.lateral,
+    drawnKey,
+  ].join("|");
   if (key === lastPreviewKey && demOverlay) return;
   const seq = (demPreviewSeq += 1);
   const body = new FormData();
@@ -600,6 +739,7 @@ async function refreshDemOverlay() {
   body.set("along", alongInput.value || "300");
   body.set("length", runForm.length.value);
   body.set("stream", "1");
+  appendAoiFields(body);
   showDemProgress(0, "Finding LINZ tiles…");
   try {
     const res = await fetch("/api/dem-preview?stream=1", { method: "POST", body });
@@ -627,6 +767,8 @@ async function refreshDemOverlay() {
       interactive: false,
       className: "dem-overlay",
     }).addTo(map);
+    aoiFromServer = data.aoi || null;
+    redrawAoi(aoiFromServer);
     lastPreviewKey = key;
     refreshLegend();
     adaptMapLayout();
@@ -1214,10 +1356,10 @@ function setMode(next) {
     setStatus("Cross-section tool is on. Click two points on the map.", "ok");
   } else if (mode === "params") {
     map.dragging.enable();
-    setCoach("Set transect length and spacing, then Run screening. Use Cross-section to sample the DEM, or double-click to pin a different bridge.");
+    setCoach("Set the DEM area of interest, then Run screening. Use Cross-section to sample the DEM, or double-click to pin a different bridge.");
   } else if (marker) {
     map.dragging.enable();
-    setCoach("Draw the river centreline through the bridge, or double-click elsewhere to move the pin.");
+    setCoach("Set the DEM area of interest, then draw the river centreline through the bridge, or double-click elsewhere to move the pin.");
   } else {
     map.dragging.enable();
     setCoach("Navigate the map, then double-click a bridge to drop a pin.");
@@ -1445,14 +1587,16 @@ function renderResults(payload, { scroll = true } = {}) {
       : payload.layout.flow_m3_s != null
         ? ` Target Q ${payload.layout.flow_m3_s} m³/s, n=${payload.layout.mannings_n}, slope from centreline S=${formatSlope(payload.layout.slope)}.`
         : "";
-    const clipM = payload.layout.clip_size_m != null
-      ? `, ${Number(payload.layout.clip_size_m).toFixed(0)} m clip`
-      : "";
+    const clipNote = payload.layout.upstream_m != null
+      ? `, ${Number(payload.layout.upstream_m).toFixed(0)} m up / ${Number(payload.layout.downstream_m).toFixed(0)} m down / ${Number(payload.layout.lateral_m).toFixed(0)} m each side`
+      : payload.layout.clip_size_m != null
+        ? `, ${Number(payload.layout.clip_size_m).toFixed(0)} m clip`
+        : "";
     const sheets = Array.isArray(payload.layout.tiles) && payload.layout.tiles.length
       ? ` from ${payload.layout.tiles.join(", ")}`
       : "";
     const dem = payload.layout.dem_source === "linz-lidar-1m"
-      ? ` Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859${clipM}${sheets}).`
+      ? ` Elevations from the New Zealand LiDAR 1m DEM (LINZ layer 121859${clipNote}${sheets}).`
       : "";
     resultsNote.textContent = `${resultsNote.textContent} ${extra}${flow}${dem}`;
   }
@@ -1608,7 +1752,9 @@ clearBtn.addEventListener("click", () => {
   drawnLatLngs = [];
   ranTransects = false;
   overlay.clearLayers();
+  aoiFromServer = null;
   redrawDraft();
+  scheduleDemPreview();
 });
 
 finishBtn.addEventListener("click", finishCentreline);
@@ -1644,13 +1790,19 @@ runForm.addEventListener("input", (event) => {
     scheduleDemPreview();
     refreshLegend();
   }
+  if (event.target && (event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral")) {
+    aoiFromServer = null;
+    redrawAoi(null);
+    scheduleDemPreview();
+    refreshLegend();
+  }
   if (event.target && event.target.matches("[data-ari]")) {
     refreshAriPlot();
   }
 });
 
 runForm.addEventListener("change", (event) => {
-  if (event.target.name === "length") {
+  if (event.target.name === "length" || event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral") {
     scheduleDemPreview();
   }
   if (event.target && event.target.matches("[data-ari], [name^='flow_']")) {
@@ -1732,7 +1884,7 @@ runForm.addEventListener("submit", async (event) => {
   runJobId = jobId;
   runAbort = new AbortController();
   setRunning(true);
-  setStatus("Downloading the 500 m LiDAR clip and running screening… Click Stop to change parameters and run again.");
+  setStatus("Cropping the LiDAR area of interest and running screening… Click Stop to change parameters and run again.");
   try {
     const res = await fetch("/api/run", {
       method: "POST",

@@ -12,13 +12,13 @@ from hydroscreen import plan_linz_clip
 SAMPLE_DEM = Path(__file__).resolve().parent / "fixtures" / "sample_dem.tif"
 
 
-def _fake_extract(lat, lon, out_tif, progress=None):
+def _fake_extract(lat, lon, out_tif, progress=None, **kwargs):
     Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(SAMPLE_DEM, out_tif)
     return str(out_tif), plan_linz_clip(lat, lon)
 
 
-def _fake_iter_extract(lat, lon, out_tif):
+def _fake_iter_extract(lat, lon, out_tif, **kwargs):
     path, plan = _fake_extract(lat, lon, out_tif)
     yield {"percent": 8, "message": "Downloading", "plan": plan}
     yield {"percent": 100, "message": "DEM ready", "path": path, "plan": plan}
@@ -40,7 +40,10 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="busy-bar"', html)
         self.assertIn('id="busy-pct"', html)
         self.assertIn('id="dem-opacity"', html)
-        self.assertIn("500 m", html)
+        self.assertIn('name="upstream"', html)
+        self.assertIn('name="downstream"', html)
+        self.assertIn('name="lateral"', html)
+        self.assertIn("area of interest", html)
         self.assertIn("busy-spinner", html)
         self.assertIn("xs-measure", html)
         self.assertIn('id="xs-measure"', html)
@@ -50,7 +53,7 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn("class=\"app-frame\"", html)
         self.assertIn("class=\"workspace\"", html)
         self.assertIn("class=\"map-stage\"", html)
-        self.assertIn("outputs/linz-tiles", html)
+        self.assertIn("area of interest", html)
         self.assertIn("Return period (ARI)", html)
         self.assertIn("1,000-year", html)
         self.assertIn('id="ari-list"', html)

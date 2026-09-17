@@ -1,4 +1,4 @@
-"""Full LINZ sheets are downloaded locally, then clipped to the bridge square."""
+"""Full LINZ sheets can still be saved locally; screening windows COGs instead."""
 
 import tempfile
 import unittest

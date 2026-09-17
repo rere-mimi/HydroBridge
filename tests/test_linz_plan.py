@@ -1,4 +1,4 @@
-"""Methodology: pick LINZ 1 m tiles, download them, then clip locally."""
+"""Methodology: pick LINZ 1 m tiles and window-crop the AOI, without whole-sheet downloads."""
 
 import os
 import tempfile
@@ -50,14 +50,16 @@ class PlanLinzClipTests(unittest.TestCase):
     def test_extract_opens_only_the_planned_sheets(self):
         plan = plan_linz_clip(-41.2865, 174.7762)
         seen = {}
+        downloads = []
 
         def fake_download(code):
+            downloads.append(code)
             dest = Path(os.environ["HYDROBRIDGE_LINZ_TILES"]) / f"{code}.tiff"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"FULL-TILE" * 40)
             yield 1.0, f"Saved {code}"
 
-        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
+        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None, geometry=None):
             seen["uris"] = list(uris)
             seen["bounds"] = bounds
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
@@ -77,22 +79,22 @@ class PlanLinzClipTests(unittest.TestCase):
                         path, used = extract_linz_dem_for_bridge(-41.2865, 174.7762, str(out))
             self.assertEqual(path, str(out))
             self.assertEqual(used["tiles"], plan["tiles"])
-            self.assertEqual(seen["uris"], used["paths"])
+            self.assertEqual(downloads, [])
+            self.assertEqual(seen["uris"], [f"/vsicurl/{url}" for url in used["urls"]])
             self.assertEqual(seen["bounds"], plan["bounds_2193"])
             self.assertGreater(Path(path).stat().st_size, 256)
-            self.assertTrue(all(Path(p).exists() for p in used["paths"]))
+            self.assertFalse(any(Path(p).exists() for p in used["paths"]))
 
-    def test_extract_still_downloads_tiles_when_the_clip_is_cached(self):
+    def test_extract_reuses_the_cached_clip_without_downloading_tiles(self):
         downloads = []
+        clips = []
 
         def fake_download(code):
             downloads.append(code)
-            dest = Path(os.environ["HYDROBRIDGE_LINZ_TILES"]) / f"{code}.tiff"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"FULL-TILE" * 40)
             yield 1.0, f"Saved {code}"
 
-        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
+        def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None, geometry=None):
+            clips.append(out_tif)
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
             Path(out_tif).write_bytes(b"LINZ-CLIP" * 40)
             return out_tif
@@ -109,7 +111,8 @@ class PlanLinzClipTests(unittest.TestCase):
                         second = Path(tmp) / "b.tif"
                         extract_linz_dem_for_bridge(-41.2865, 174.7762, str(first))
                         extract_linz_dem_for_bridge(-41.2865, 174.7762, str(second))
-            self.assertGreaterEqual(len(downloads), 2)
+            self.assertEqual(downloads, [])
+            self.assertEqual(len(clips), 1)
             self.assertTrue(second.exists())
             self.assertEqual(second.read_bytes(), first.read_bytes())
 

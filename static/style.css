@@ -448,6 +448,10 @@ body.is-busy .mark {
 .swatch.river { background: var(--river); height: 0.28rem; border-radius: 999px; }
 .swatch.transect { background: var(--transect); height: 0.28rem; }
 .swatch.dem { background: linear-gradient(90deg, #14532d, #a3e635, #fef3c7); }
+.swatch.aoi {
+  background: transparent;
+  box-shadow: inset 0 0 0 2px #f59e0b;
+}
 .swatch.xs { background: var(--xs); height: 0.28rem; border-radius: 999px; }
 
 .params {
@@ -516,6 +520,10 @@ fieldset.field {
 .unit-field span { color: var(--muted); font-size: 0.8rem; }
 
 .ari-field .muted { margin: 0.35rem 0 0; }
+
+.aoi-field .muted { margin: 0.35rem 0 0.15rem; }
+
+.aoi-field .field { margin: 0.4rem 0; }
 
 .ari-list {
   display: grid;
@@ -748,6 +756,18 @@ button { font: inherit; cursor: pointer; }
   box-shadow: 0 6px 16px rgba(91, 33, 182, 0.32);
   white-space: nowrap;
 }
+
+.aoi-label {
+  background: rgba(245, 158, 11, 0.95);
+  color: #0f172a;
+  border: 0;
+  border-radius: 999px;
+  padding: 0.08rem 0.38rem;
+  font: 700 0.7rem/1.2 "Segoe UI", system-ui, sans-serif;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.2);
+}
+
+.aoi-label::before { display: none; }
 
 .xs-head {
   display: flex;
