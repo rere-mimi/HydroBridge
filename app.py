@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import re
 import secrets
 import tempfile
@@ -19,6 +18,7 @@ from flask import Flask, Response, abort, jsonify, render_template, request, sen
 from hydroscreen import (
     HydroScreenCancelled,
     HydroScreenError,
+    iter_dem_preview,
     preview_dem_overlay,
     run_screening,
     sample_drawn_cross_section,
@@ -170,56 +170,42 @@ def dem_preview():
 
     stream = (src.get("stream") or request.args.get("stream") or "").strip() == "1"
     if stream:
-        events = queue.Queue()
-
-        def on_progress(fraction, message=None):
-            events.put({
-                "percent": int(round(max(0.0, min(1.0, float(fraction))) * 100)),
-                "message": message or "Downloading DEM…",
-            })
-
-        def work():
+        def generate():
             try:
-                result = preview_dem_overlay(
-                    lat,
-                    lon,
-                    dem_path=dem_path,
-                    along_m=along_m,
-                    length=length,
-                    progress=on_progress,
-                )
-                payload = _preview_payload(result)
-                payload["percent"] = 100
-                payload["message"] = "DEM ready"
-                payload["done"] = True
-                events.put(payload)
+                for event in iter_dem_preview(
+                    lat, lon, dem_path=dem_path, along_m=along_m, length=length
+                ):
+                    if event.get("done"):
+                        payload = _preview_payload(event)
+                        payload["percent"] = 100
+                        payload["message"] = event.get("message") or "DEM ready"
+                        payload["done"] = True
+                        yield json.dumps(payload) + "\n"
+                    else:
+                        yield json.dumps({
+                            "percent": int(event.get("percent") or 0),
+                            "message": event.get("message") or "Downloading DEM…",
+                        }) + "\n"
             except HydroScreenError as exc:
-                events.put({"error": str(exc), "percent": 0, "done": True})
+                yield json.dumps({"error": str(exc), "percent": 0, "done": True}) + "\n"
             except Exception as exc:
                 logging.exception("DEM preview failed")
-                events.put({
+                yield json.dumps({
                     "error": f"Could not overlay the DEM: {exc}",
                     "percent": 0,
                     "done": True,
-                })
+                }) + "\n"
             finally:
                 if dem_source == "upload" and dem_path:
                     Path(dem_path).unlink(missing_ok=True)
-                events.put(None)
-
-        threading.Thread(target=work, daemon=True).start()
-
-        def generate():
-            yield json.dumps({"percent": 0, "message": "Downloading DEM…"}) + "\n"
-            while True:
-                item = events.get()
-                if item is None:
-                    break
-                yield json.dumps(item) + "\n"
 
         return Response(
             stream_with_context(generate()),
             mimetype="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     try:

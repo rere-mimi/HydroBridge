@@ -444,13 +444,21 @@ async function readPreviewStream(res) {
     buf = lines.pop();
     for (const line of lines) {
       if (!line.trim()) continue;
-      last = JSON.parse(line);
+      try {
+        last = JSON.parse(line);
+      } catch (_err) {
+        continue;
+      }
       if (last.percent != null) showDemProgress(last.percent, last.message);
     }
   }
   if (buf.trim()) {
-    last = JSON.parse(buf);
-    if (last && last.percent != null) showDemProgress(last.percent, last.message);
+    try {
+      last = JSON.parse(buf);
+      if (last && last.percent != null) showDemProgress(last.percent, last.message);
+    } catch (_err) {
+      /* keep last complete event */
+    }
   }
   return last || {};
 }
@@ -489,7 +497,7 @@ async function refreshDemOverlay() {
     if (!res.ok || data.error || !data.png || !data.bounds) {
       clearDemOverlay();
       lastPreviewKey = "";
-      if (data.error) setStatus(data.error, "error");
+      setStatus(data.error || "Could not download the DEM for this site.", "error");
       return;
     }
     const bytes = Uint8Array.from(atob(data.png), (ch) => ch.charCodeAt(0));
@@ -503,10 +511,11 @@ async function refreshDemOverlay() {
     }).addTo(map);
     lastPreviewKey = key;
     refreshLegend();
-  } catch (_err) {
+  } catch (err) {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
     lastPreviewKey = "";
+    setStatus((err && err.message) || "Could not download the DEM.", "error");
   } finally {
     if (seq === demPreviewSeq) hideDemProgress();
   }

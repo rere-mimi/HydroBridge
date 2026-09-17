@@ -289,10 +289,12 @@ def _configure_gdal_http():
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
     os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "4")
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
-    os.environ.setdefault("GDAL_HTTP_MULTIPLEX", "YES")
-    os.environ.setdefault("GDAL_HTTP_VERSION", "2")
+    os.environ.setdefault("GDAL_HTTP_TIMEOUT", "60")
+    os.environ.setdefault("GDAL_HTTP_CONNECTTIMEOUT", "20")
+    os.environ.setdefault("GDAL_HTTP_VERSION", "1.1")
     os.environ.setdefault("GDAL_CACHEMAX", "256")
     os.environ.setdefault("GDAL_INGESTED_BYTES_AT_OPEN", "65536")
+    os.environ.setdefault("GDAL_HTTP_USERAGENT", "HydroBridge/0.1")
     os.environ.setdefault("CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF,.TIFF")
     os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
     os.environ.setdefault("GDAL_HTTP_MERGE_CONSECUTIVE_RANGES", "YES")
@@ -342,44 +344,32 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
     try:
         _emit_progress(progress, 0.04, "Opening DEM tiles")
         for uri in tile_uris:
-            datasets.append(rasterio.open(uri))
+            try:
+                datasets.append(rasterio.open(uri))
+            except Exception as exc:
+                if "/vsicurl/" in str(uri):
+                    raise HydroScreenError(
+                        "Could not open the New Zealand LiDAR 1m DEM. "
+                        f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
+                    ) from exc
+                raise
         if not datasets:
             raise HydroScreenError("No DEM tiles were available to clip.")
-        _emit_progress(progress, 0.1, "Downloading DEM")
-        res = float(resolution) if resolution is not None else float(datasets[0].res[0])
-        height = max(1, int(round((north - south) / res)))
-        n_strips = 1 if progress is None else min(10, height)
-        merge_kw = {"nodata": nodata, "res": (res, res)}
-        strips = []
-        transform = None
-        for i in range(n_strips):
-            strip_north = north - (i / n_strips) * (north - south)
-            strip_south = north - ((i + 1) / n_strips) * (north - south)
-            if strip_north <= strip_south:
-                continue
-            mosaic, transform_i = raster_merge(
-                datasets,
-                bounds=(west, strip_south, east, strip_north),
-                **merge_kw,
-            )
-            strips.append(mosaic[0])
-            if transform is None:
-                transform = transform_i
-            _emit_progress(
-                progress,
-                0.1 + 0.8 * ((i + 1) / n_strips),
-                "Downloading DEM",
-            )
-        if not strips:
-            raise HydroScreenError("Invalid DEM clip window.")
-        width = min(s.shape[1] for s in strips)
-        data = np.vstack([s[:, :width] for s in strips])
+        _emit_progress(progress, 0.12, "Downloading DEM")
+        merge_kw = {
+            "bounds": (west, south, east, north),
+            "nodata": nodata,
+        }
+        if resolution is not None:
+            merge_kw["res"] = (float(resolution), float(resolution))
+        mosaic, transform = raster_merge(datasets, **merge_kw)
+        data = mosaic[0]
         valid = np.isfinite(data) & (data != nodata)
         if not np.any(valid):
             raise HydroScreenError(
                 "The New Zealand LiDAR 1m DEM has no elevation values at this site."
             )
-        _emit_progress(progress, 0.94, "Writing DEM clip")
+        _emit_progress(progress, 0.9, "Writing DEM clip")
         profile = {
             "driver": "GTiff",
             "height": int(data.shape[0]),
@@ -527,6 +517,52 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
     return buf.getvalue(), (west, south, east, north)
 
 
+def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
+    """Yield progress events, then a final overlay result with png/bounds."""
+    _ = (along_m, length, buffer)
+    yield {"percent": 0, "message": "Downloading DEM…"}
+    bounds_2193 = square_clip_2193(lat, lon)
+    bbox = bbox_4326_from_2193(bounds_2193)
+    radius = DEM_CLIP_SIZE_M / 2.0
+    temp_dir = None
+    src_path = dem_path
+    source = "local"
+    try:
+        if src_path is None:
+            yield {"percent": 8, "message": "Finding DEM tiles"}
+            temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
+            src_path = os.path.join(temp_dir, "dem.tif")
+            yield {"percent": 15, "message": "Downloading DEM"}
+            try:
+                download_linz_lidar_1m(bbox, src_path, bounds_2193=bounds_2193)
+            except HydroScreenError:
+                raise
+            except Exception as exc:
+                logging.exception("LINZ 1m DEM download failed")
+                raise HydroScreenError(
+                    "Could not download the New Zealand LiDAR 1m DEM. "
+                    f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
+                ) from exc
+            source = "linz-lidar-1m"
+            yield {"percent": 85, "message": "Drawing DEM overlay"}
+        else:
+            yield {"percent": 40, "message": "Reading DEM"}
+        png, bounds = render_dem_overlay_png(src_path, bbox)
+        yield {
+            "percent": 100,
+            "message": "DEM ready",
+            "done": True,
+            "png": png,
+            "bounds": bounds,
+            "source": source,
+            "radius_m": float(radius),
+            "clip_size_m": DEM_CLIP_SIZE_M,
+        }
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def preview_dem_overlay(
     lat,
     lon,
@@ -537,40 +573,21 @@ def preview_dem_overlay(
     progress=None,
 ):
     """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
-    bounds_2193 = square_clip_2193(lat, lon)
-    bbox = bbox_4326_from_2193(bounds_2193)
-    radius = DEM_CLIP_SIZE_M / 2.0
-    temp_dir = None
-    src_path = dem_path
-    source = "local"
-    try:
-        if src_path is None:
-            _emit_progress(progress, 0.02, "Downloading DEM")
-            temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
-            src_path = os.path.join(temp_dir, "dem.tif")
-
-            def download_progress(fraction, message=None):
-                _emit_progress(progress, 0.05 + 0.8 * float(fraction), message or "Downloading DEM")
-
-            download_linz_lidar_1m(
-                bbox, src_path, bounds_2193=bounds_2193, progress=download_progress
-            )
-            source = "linz-lidar-1m"
-        else:
-            _emit_progress(progress, 0.45, "Reading DEM")
-        _emit_progress(progress, 0.9, "Drawing DEM overlay")
-        png, bounds = render_dem_overlay_png(src_path, bbox)
-        _emit_progress(progress, 1.0, "DEM ready")
-        return {
-            "png": png,
-            "bounds": bounds,
-            "source": source,
-            "radius_m": float(radius),
-            "clip_size_m": DEM_CLIP_SIZE_M,
-        }
-    finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+    result = None
+    for event in iter_dem_preview(
+        lat, lon, dem_path=dem_path, along_m=along_m, length=length, buffer=buffer
+    ):
+        if progress is not None and "percent" in event:
+            _emit_progress(progress, event["percent"] / 100.0, event.get("message"))
+        if event.get("done"):
+            result = {
+                "png": event["png"],
+                "bounds": event["bounds"],
+                "source": event["source"],
+                "radius_m": event["radius_m"],
+                "clip_size_m": event["clip_size_m"],
+            }
+    return result
 
 
 def centerline_reach(centerline, lon, lat, along_m):
