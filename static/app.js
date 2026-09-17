@@ -36,6 +36,7 @@ const nameInput = document.getElementById("bridge-name");
 const nameCoords = document.getElementById("name-coords");
 const xsViewer = document.getElementById("xs-viewer");
 const xsMeta = document.getElementById("xs-meta");
+const xsTitle = document.getElementById("xs-title");
 const xsCanvas = document.getElementById("xs-canvas");
 const busyEl = document.getElementById("busy");
 const busyText = document.getElementById("busy-text");
@@ -162,6 +163,8 @@ let lastPreviewKey = "";
 let demTiles = [];
 let demProgressOn = false;
 let demTransparency = 50;
+var lastRun = null;
+var selectedSection = null;
 try {
   const savedTransparency = localStorage.getItem("hydroscreen-dem-transparency");
   if (savedTransparency != null && savedTransparency !== "") {
@@ -341,7 +344,11 @@ function refreshLegend() {
     const length = Number(runForm.length.value);
     items.push({
       swatch: "transect",
-      label: `Transects — ${length} m wide, every ${spacing} m`,
+      label: `Transects — ${length} m wide, every ${spacing} m · click one to inspect`,
+    });
+    items.push({
+      swatch: "river",
+      label: "Click the centreline for the long section",
     });
   }
   if (xsPoints.length === 2) {
@@ -526,6 +533,7 @@ function centerlinePayload() {
 
 function redrawDraft() {
   draftLine.setLatLngs(drawnLatLngs);
+  draftLine.setStyle({ opacity: drawnLatLngs.length ? 0.95 : 0 });
   vertexLayer.clearLayers();
   drawnLatLngs.forEach((ll) => {
     L.circleMarker(ll, {
@@ -559,6 +567,8 @@ function finishCentreline() {
     return;
   }
   ranTransects = false;
+  lastRun = null;
+  selectedSection = null;
   overlay.clearLayers();
   setMode("params");
   scheduleDemPreview();
@@ -605,7 +615,7 @@ function clearXsChart() {
   ctx.clearRect(0, 0, width, height);
 }
 
-function drawXsProfile(profile) {
+function drawXsProfile(profile, options = {}) {
   if (!xsCanvas || !profile) return;
   const dists = profile.distance_m || [];
   const elevs = profile.elevation_m || [];
@@ -634,6 +644,11 @@ function drawXsProfile(profile) {
   let zmin = Math.min(...finite);
   let zmax = Math.max(...finite);
   if (zmax <= zmin) zmax = zmin + 1;
+  const water = options.waterLevel;
+  if (water != null && Number.isFinite(Number(water))) {
+    zmin = Math.min(zmin, Number(water));
+    zmax = Math.max(zmax, Number(water));
+  }
   const zPad = (zmax - zmin) * 0.08;
   zmin -= zPad;
   zmax += zPad;
@@ -651,7 +666,7 @@ function drawXsProfile(profile) {
 
   ctx.fillStyle = "#64748b";
   ctx.font = "11px Segoe UI, system-ui, sans-serif";
-  ctx.fillText("Distance (m)", pad.left + plotW / 2 - 32, cssH - 8);
+  ctx.fillText(options.xLabel || "Distance (m)", pad.left + plotW / 2 - 32, cssH - 8);
   ctx.save();
   ctx.translate(14, pad.top + plotH / 2);
   ctx.rotate(-Math.PI / 2);
@@ -713,13 +728,62 @@ function drawXsProfile(profile) {
   ctx.strokeStyle = "#0f172a";
   ctx.lineWidth = 2;
   ctx.stroke();
+
+  if (water != null && Number.isFinite(Number(water))) {
+    const y = yOf(Number(water));
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + plotW, y);
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#1f6f8b";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#1f6f8b";
+    ctx.font = "11px Segoe UI, system-ui, sans-serif";
+    ctx.fillText(`WL ${Number(water).toFixed(2)} m`, pad.left + 6, Math.max(pad.top + 12, y - 6));
+  }
+
+  (options.stations || []).forEach((station) => {
+    const dist = Number(station.distance_m);
+    if (!Number.isFinite(dist)) return;
+    const x = xOf(Math.max(0, Math.min(xmax, dist)));
+    let z = null;
+    if (dists.length) {
+      let best = 0;
+      let bestAbs = Infinity;
+      dists.forEach((d, i) => {
+        const gap = Math.abs(Number(d) - dist);
+        if (gap < bestAbs && elevs[i] != null && Number.isFinite(Number(elevs[i]))) {
+          bestAbs = gap;
+          best = i;
+        }
+      });
+      z = elevs[best];
+    }
+    const y = z != null && Number.isFinite(Number(z)) ? yOf(Number(z)) : pad.top + plotH;
+    ctx.beginPath();
+    ctx.arc(x, y, station.selected ? 5.5 : 4, 0, Math.PI * 2);
+    ctx.fillStyle = station.selected ? "#e11d48" : "#ea580c";
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+    if (station.label) {
+      ctx.fillStyle = "#0f172a";
+      ctx.font = "10px Segoe UI, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(station.label), x, y - 8);
+      ctx.textAlign = "start";
+    }
+  });
 }
 
 function showXsViewer() {
   xsViewer.hidden = false;
   adaptMapLayout();
   requestAnimationFrame(() => {
-    if (xsProfile) drawXsProfile(xsProfile);
+    if (xsProfile) drawXsProfile(xsProfile, xsProfile.options || {});
   });
 }
 
@@ -740,6 +804,7 @@ function resetXsDrawing({ keepViewer = false } = {}) {
   refreshLegend();
   if (keepViewer) {
     clearXsChart();
+    if (xsTitle) xsTitle.textContent = "DEM cross-section";
     setXsMeta("Left-click two points on the map.");
   } else {
     hideXsViewer();
@@ -767,6 +832,7 @@ async function requestXsProfile(start, end) {
       return;
     }
     xsProfile = data;
+    if (xsTitle) xsTitle.textContent = "DEM cross-section";
     setStatus("");
     const source = data.source === "linz-lidar-1m" ? "New Zealand LiDAR 1m DEM" : "selected DEM";
     setXsMeta(
@@ -881,31 +947,127 @@ function placeBridge(lat, lon, name) {
   overlay.clearLayers();
   redrawDraft();
   resultsEl.hidden = true;
+  lastRun = null;
+  selectedSection = null;
   setMode("draw");
   scheduleDemPreview();
 }
 
+function stopOverlayClick(event) {
+  L.DomEvent.stop(event);
+  if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+}
+
+function selectSection(next, { scroll = false } = {}) {
+  selectedSection = next;
+  if (!lastRun) return;
+  drawRunGeometry(lastRun);
+  renderResults(lastRun, { scroll });
+  showSelectedProfile();
+}
+
+function showSelectedProfile() {
+  if (!lastRun || !selectedSection) return;
+  if (selectedSection.type === "transect") {
+    const feat = (lastRun.transects || []).find((item) => item.transect === selectedSection.id);
+    const row = (lastRun.summary || []).find((item) => item.transect === selectedSection.id);
+    if (!feat || !feat.distance_m) return;
+    const water = feat.water_level_m != null ? feat.water_level_m : row && row.water_level_m;
+    xsProfile = {
+      distance_m: feat.distance_m,
+      elevation_m: feat.elevation_m,
+      options: { waterLevel: water },
+    };
+    if (xsTitle) xsTitle.textContent = `Transect ${feat.transect}`;
+    setXsMeta(
+      `Offset ${fmt(feat.offset_m, 0)} m along the centreline · ${feat.n_samples || feat.distance_m.length} samples`
+    );
+    showXsViewer();
+    requestAnimationFrame(() => drawXsProfile(xsProfile, xsProfile.options));
+    return;
+  }
+  if (selectedSection.type === "centerline") {
+    const profile = lastRun.centerline_profile;
+    if (!profile || !profile.distance_m) return;
+    const origin = Number(profile.origin_m) || 0;
+    const stations = (lastRun.transects || []).map((tran) => ({
+      distance_m: tran.station_m != null ? Number(tran.station_m) : origin + Number(tran.offset_m || 0),
+      label: String(tran.transect),
+      selected: false,
+    }));
+    xsProfile = {
+      distance_m: profile.distance_m,
+      elevation_m: profile.elevation_m,
+      options: {
+        stations,
+        xLabel: "Distance along centreline (m)",
+      },
+    };
+    if (xsTitle) xsTitle.textContent = "Centreline profile";
+    setXsMeta(
+      `${stations.length} transect stations along the ${fmt(profile.length_m || profile.distance_m[profile.distance_m.length - 1], 0)} m river line`
+    );
+    showXsViewer();
+    requestAnimationFrame(() => drawXsProfile(xsProfile, xsProfile.options));
+  }
+}
+
 function drawRunGeometry(payload) {
   overlay.clearLayers();
+  draftLine.setStyle({ opacity: 0 });
+  vertexLayer.clearLayers();
+  const selectedId = selectedSection && selectedSection.type === "transect" ? selectedSection.id : null;
+  const centerlineSelected = selectedSection && selectedSection.type === "centerline";
+  const cl = payload.centerline || [];
+  if (cl.length >= 2) {
+    const river = L.polyline(
+      cl.map(([lon, lat]) => [lat, lon]),
+      {
+        color: "#0369a1",
+        weight: centerlineSelected ? 7 : 5,
+        opacity: 0.95,
+        interactive: true,
+      }
+    ).addTo(overlay);
+    river.on("click", (event) => {
+      stopOverlayClick(event);
+      selectSection({ type: "centerline" });
+    });
+    river.bindTooltip("Centreline — click for the long section", { sticky: true });
+  }
   (payload.transects || []).forEach((tran) => {
+    const selected = selectedId === tran.transect;
     const line = (tran.coords || []).map(([lon, lat]) => [lat, lon]);
-    L.polyline(line, { color: "#ea580c", weight: 2, opacity: 0.85, interactive: false }).addTo(overlay);
+    const poly = L.polyline(line, {
+      color: selected ? "#be123c" : "#ea580c",
+      weight: selected ? 5 : 3,
+      opacity: selected || !selectedId ? 0.95 : 0.45,
+      interactive: true,
+    }).addTo(overlay);
+    const pick = (event) => {
+      stopOverlayClick(event);
+      selectSection({ type: "transect", id: tran.transect });
+    };
+    poly.on("click", pick);
+    poly.bindTooltip(`Transect ${tran.transect}`, { sticky: true });
     (tran.samples || []).forEach(([lon, lat]) => {
       L.circleMarker([lat, lon], {
-        radius: 3,
-        color: "#ea580c",
+        radius: selected ? 5 : 3,
+        color: selected ? "#be123c" : "#ea580c",
         fillColor: "#fff",
         fillOpacity: 1,
         weight: 1.5,
-        interactive: false,
-      }).addTo(overlay);
+        interactive: true,
+      })
+        .on("click", pick)
+        .addTo(overlay);
     });
   });
   ranTransects = true;
   refreshLegend();
 }
 
-function renderResults(payload) {
+function renderResults(payload, { scroll = true } = {}) {
   resultsEl.hidden = false;
   adaptMapLayout();
   resultsBody.innerHTML = "";
@@ -913,7 +1075,7 @@ function renderResults(payload) {
   const lengthNote = payload.layout?.along_m != null
     ? `Transects cover the ${Number(payload.layout.along_m).toFixed(0)} m centreline you drew.`
     : "Transects follow the river centreline you drew.";
-  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote}`;
+  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects, sampled every ${payload.layout.sample_spacing_m} m.`;
     const flow = payload.layout.flow_m3_s != null
@@ -933,9 +1095,14 @@ function renderResults(payload) {
   summaryLink.hidden = !payload.summary_xlsx;
   summaryLink.href = payload.summary_xlsx || "#";
 
+  const selectedId = selectedSection && selectedSection.type === "transect" ? selectedSection.id : null;
+  const showCenterline = selectedSection && selectedSection.type === "centerline";
   (payload.summary || []).forEach((row) => {
     const status = row.overtopped ? "Overtops banks" : (row.conveys ? "OK" : "Cannot convey");
     const tr = document.createElement("tr");
+    if (selectedId === row.transect) tr.classList.add("is-selected");
+    tr.tabIndex = 0;
+    tr.setAttribute("role", "button");
     tr.innerHTML = `
       <td>${row.transect}</td>
       <td>${fmt(row.offset_m, 1)}</td>
@@ -948,8 +1115,11 @@ function renderResults(payload) {
       <td>${fmt(row.velocity_m_s, 2)}</td>
       <td>${fmt(row.discharge_m3_s, 2)}</td>
       <td>${status}</td>`;
+    tr.addEventListener("click", () => selectSection({ type: "transect", id: row.transect }, { scroll: false }));
     resultsBody.appendChild(tr);
 
+    if (showCenterline) return;
+    if (selectedId != null && selectedId !== row.transect) return;
     const fig = document.createElement("figure");
     fig.innerHTML = `
       <img src="${row.plot}" alt="Cross-section for transect ${row.transect}">
@@ -958,7 +1128,7 @@ function renderResults(payload) {
         · <a href="${row.csv}">CSV</a></figcaption>`;
     plotsEl.appendChild(fig);
   });
-  resultsEl.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (scroll) resultsEl.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function hideSearchResults() {
@@ -1192,10 +1362,14 @@ runForm.addEventListener("submit", async (event) => {
       setStatus(data.error || "Screening failed.", "error");
       return;
     }
-    setStatus("Screening complete.", "ok");
+    setStatus("Screening complete. Click a transect to inspect that section, or the centreline for the long profile.", "ok");
     setMode("params");
+    lastRun = data;
+    selectedSection = { type: "centerline" };
     drawRunGeometry(data);
     renderResults(data);
+    showSelectedProfile();
+    setCoach("Click an orange transect to see only that cross-section. Click the blue centreline to see transect stations along the river.");
     if (marker) marker.setLatLng([data.lat, data.lon]);
   } catch (err) {
     if (err && err.name === "AbortError") {
@@ -1236,7 +1410,7 @@ function adaptMapLayout() {
   document.body.classList.toggle("has-results", Boolean(resultsEl && !resultsEl.hidden));
   requestAnimationFrame(() => {
     map.invalidateSize();
-    if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile);
+    if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile, xsProfile.options || {});
   });
 }
 

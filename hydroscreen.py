@@ -1371,16 +1371,43 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, c
 
 def estimate_centerline_slope(dem_path, centerline, spacing_m=10.0, src=None):
     """Bed slope along the river centreline from DEM samples, as |dz/ds|."""
-    dists, elevs, _ = sample_dem_along_line(dem_path, centerline, spacing_m=spacing_m, src=src)
+    slope, _dists, _elevs = centerline_slope_and_profile(
+        dem_path, centerline, spacing_m=spacing_m, src=src
+    )
+    return slope
+
+
+def centerline_slope_and_profile(dem_path, centerline, spacing_m=10.0, src=None):
+    """Return (|dz/ds|, distances_m, elevations) along the centreline."""
+    dists, elevs, _coords = sample_dem_along_line(
+        dem_path, centerline, spacing_m=spacing_m, src=src
+    )
     mask = np.isfinite(elevs)
     if mask.sum() < 2:
-        return None
+        return None, dists, elevs
     distance = dists[mask]
     elevation = elevs[mask]
     if float(distance[-1] - distance[0]) < 1.0:
-        return None
+        return None, dists, elevs
     slope, _intercept = np.polyfit(distance.astype(float), elevation.astype(float), 1)
-    return max(abs(float(slope)), 1e-6)
+    return max(abs(float(slope)), 1e-6), dists, elevs
+
+
+def centerline_bridge_station_m(centerline, lon, lat):
+    """Metres along the centreline from its start to the bridge pin."""
+    transformer_to_3857 = _transformer("EPSG:4326", "EPSG:3857")
+    proj_line = LineString(
+        [transformer_to_3857.transform(x, y) for x, y in centerline.coords]
+    )
+    bx, by = transformer_to_3857.transform(lon, lat)
+    return float(proj_line.project(Point(bx, by))), float(proj_line.length)
+
+
+def _profile_json(dists, elevs):
+    return {
+        "distance_m": [float(x) for x in dists],
+        "elevation_m": [None if not np.isfinite(z) else float(z) for z in elevs],
+    }
 
 
 def plot_cross_section(dists, elevs, out_png, water_level=None):
@@ -1621,7 +1648,7 @@ def run_screening(
     transect_features = []
     point_id = 1
     with rasterio.open(dem_path) as dem_src:
-        slope = estimate_centerline_slope(
+        slope, cl_dists, cl_elevs = centerline_slope_and_profile(
             dem_path, reach, spacing_m=max(sample_spacing, 5.0), src=dem_src
         )
         if slope is None:
@@ -1630,6 +1657,10 @@ def run_screening(
                 "Draw the river through the bridge pin so it sits on the LiDAR window."
             )
         logging.info("Estimated centreline slope S=%.6f", slope)
+        origin_m, line_len_m = centerline_bridge_station_m(reach, lon, lat)
+        cl_json = _profile_json(cl_dists, cl_elevs)
+        cl_json["origin_m"] = float(origin_m)
+        cl_json["length_m"] = float(cl_dists[-1]) if len(cl_dists) else float(line_len_m)
 
         for i, (tran, offset) in enumerate(transects):
             check_cancelled(cancel_event)
@@ -1677,12 +1708,19 @@ def run_screening(
                 sample_preview = sample_preview[::step]
                 if sample_preview[-1] != sample_coords[-1]:
                     sample_preview.append(sample_coords[-1])
+            profile = _profile_json(dists, elevs)
+            mid = tran.interpolate(0.5, normalized=True)
+            station_m, _ = centerline_bridge_station_m(reach, mid.x, mid.y)
             transect_features.append({
                 "transect": i + 1,
                 "offset_m": float(offset),
+                "station_m": float(station_m),
                 "coords": [[x, y] for x, y in tran.coords],
                 "samples": [[x, y] for x, y in sample_preview],
                 "n_samples": int(len(dists)),
+                "distance_m": profile["distance_m"],
+                "elevation_m": profile["elevation_m"],
+                "water_level_m": stats.get("water_level_m"),
                 "csv": csv_path.name,
                 "plot": png_path.name,
             })
@@ -1703,6 +1741,7 @@ def run_screening(
         "summary": summary,
         "summary_xlsx": summary_path.name,
         "centerline": [[x, y] for x, y in centerline.coords],
+        "centerline_profile": cl_json,
         "transects": transect_features,
         "centerline_source": centerline_source,
         "used_synthetic_centerline": centerline_source == "synthetic",

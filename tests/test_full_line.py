@@ -89,6 +89,16 @@ class CoverFullLineTests(unittest.TestCase):
         self.assertGreater(result["layout"]["n_transects"], 3)
         offsets = [abs(feat["offset_m"]) for feat in result["transects"]]
         self.assertGreater(max(offsets), 80.0)
+        profile = result["centerline_profile"]
+        self.assertGreaterEqual(len(profile["distance_m"]), 2)
+        self.assertEqual(len(profile["distance_m"]), len(profile["elevation_m"]))
+        self.assertIn("origin_m", profile)
+        first = result["transects"][0]
+        self.assertGreaterEqual(len(first["distance_m"]), 2)
+        self.assertEqual(len(first["distance_m"]), len(first["elevation_m"]))
+        self.assertIn("station_m", first)
+        self.assertGreaterEqual(first["station_m"], 0.0)
+        self.assertLessEqual(first["station_m"], profile["length_m"] + 1.0)
 
 
 if __name__ == "__main__":
