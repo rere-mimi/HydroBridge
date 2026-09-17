@@ -18,6 +18,8 @@ from hydroscreen import (
     load_linz_dem_1m_index,
     render_dem_overlay_png,
     screening_dem_radius_m,
+    square_clip_2193,
+    square_clip_bbox_4326,
 )
 
 
@@ -37,9 +39,28 @@ class LinzTileIndexTests(unittest.TestCase):
         hits = linz_tiles_for_bbox((160.0, -20.0, 160.1, -19.9), tiles)
         self.assertEqual(hits, [])
 
-    def test_dem_radius_covers_transects_and_is_capped(self):
-        self.assertEqual(screening_dem_radius_m(200, 300, 200), 300.0)
-        self.assertEqual(screening_dem_radius_m(200, 8000, 200), 2000.0)
+    def test_dem_clip_is_a_fixed_500m_square(self):
+        self.assertEqual(screening_dem_radius_m(200, 300, 200), 250.0)
+        self.assertEqual(screening_dem_radius_m(200, 8000, 200), 250.0)
+
+    def test_site_clip_is_500m_square_in_nztm(self):
+        west, south, east, north = square_clip_2193(-41.2865, 174.7762)
+        self.assertAlmostEqual(east - west, 500.0, places=6)
+        self.assertAlmostEqual(north - south, 500.0, places=6)
+
+    def test_nearby_pins_share_the_same_snapped_square(self):
+        a = square_clip_2193(-41.2865, 174.7762)
+        b = square_clip_2193(-41.28655, 174.77625)
+        self.assertEqual(a, b)
+
+    def test_geographic_envelope_covers_the_nztm_square(self):
+        bbox = square_clip_bbox_4326(-41.2865, 174.7762)
+        self.assertEqual(len(bbox), 4)
+        minx, miny, maxx, maxy = bbox
+        self.assertLess(minx, maxx)
+        self.assertLess(miny, maxy)
+        self.assertLess(maxx - minx, 0.01)
+        self.assertLess(maxy - miny, 0.01)
 
     def test_centerline_reach_is_centred_on_the_pin(self):
         line = LineString([(174.770, -41.290), (174.7762, -41.2865), (174.782, -41.283)])
@@ -78,6 +99,41 @@ class ClipDemTilesTests(unittest.TestCase):
                 self.assertEqual(src.crs.to_string(), "EPSG:2193")
                 self.assertGreater(arr.size, 0)
                 self.assertTrue(np.allclose(arr[arr != -9999], 12.5))
+
+    def test_reports_clip_progress(self):
+        transform = from_origin(1748000.0, 5429000.0, 1.0, 1.0)
+        data = np.full((80, 80), 12.5, dtype=np.float32)
+        seen = []
+
+        def on_progress(fraction, message=None):
+            seen.append((float(fraction), message))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / "tile.tif"
+            out_path = Path(tmp) / "clip.tif"
+            with rasterio.open(
+                src_path,
+                "w",
+                driver="GTiff",
+                height=80,
+                width=80,
+                count=1,
+                dtype="float32",
+                crs="EPSG:2193",
+                transform=transform,
+                nodata=-9999.0,
+            ) as dst:
+                dst.write(data, 1)
+            clip_dem_tiles(
+                [str(src_path)],
+                (1748020.0, 5428940.0, 1748060.0, 5428980.0),
+                str(out_path),
+                progress=on_progress,
+            )
+        self.assertGreaterEqual(len(seen), 3)
+        self.assertEqual(seen[-1][0], 1.0)
+        percents = [item[0] for item in seen]
+        self.assertEqual(percents, sorted(percents))
 
     def test_raises_when_window_is_all_nodata(self):
         transform = from_origin(1748000.0, 5429000.0, 1.0, 1.0)

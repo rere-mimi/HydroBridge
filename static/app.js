@@ -39,6 +39,13 @@ const xsMeta = document.getElementById("xs-meta");
 const xsCanvas = document.getElementById("xs-canvas");
 const busyEl = document.getElementById("busy");
 const busyText = document.getElementById("busy-text");
+const busyPct = document.getElementById("busy-pct");
+const busyBar = document.getElementById("busy-bar");
+const busyBarFill = document.getElementById("busy-bar-fill");
+const legendEl = document.getElementById("legend");
+const demOpacityControl = document.getElementById("dem-opacity-control");
+const demOpacityInput = document.getElementById("dem-opacity");
+const demOpacityValue = document.getElementById("dem-opacity-value");
 
 const map = L.map("map", { doubleClickZoom: false }).setView(
   [CHRISTCHURCH.lat, CHRISTCHURCH.lon],
@@ -152,6 +159,34 @@ let runReady = false;
 let runBlockReason = "Double-click the map to pin a bridge, then draw the river.";
 let busyCount = 0;
 let lastPreviewKey = "";
+let demProgressOn = false;
+let demTransparency = 50;
+try {
+  const savedTransparency = localStorage.getItem("hydroscreen-dem-transparency");
+  if (savedTransparency != null && savedTransparency !== "") {
+    const parsed = Number(savedTransparency);
+    if (Number.isFinite(parsed)) demTransparency = Math.max(0, Math.min(100, parsed));
+  }
+} catch (_err) {
+  /* ignore */
+}
+
+function demOverlayOpacity() {
+  return Math.max(0, Math.min(1, 1 - demTransparency / 100));
+}
+
+function syncDemOpacityControl() {
+  if (demOpacityInput) demOpacityInput.value = String(Math.round(demTransparency));
+  if (demOpacityValue) demOpacityValue.textContent = `${Math.round(demTransparency)}%`;
+  if (demOpacityControl) demOpacityControl.hidden = !demOverlay;
+  if (legendEl) legendEl.classList.toggle("has-dem", Boolean(demOverlay));
+}
+
+function applyDemTransparency() {
+  if (demOverlay) demOverlay.setOpacity(demOverlayOpacity());
+  if (demOpacityValue) demOpacityValue.textContent = `${Math.round(demTransparency)}%`;
+  refreshLegend();
+}
 
 function setBusy(on, label) {
   if (on) {
@@ -165,6 +200,34 @@ function setBusy(on, label) {
       if (busyEl) busyEl.hidden = true;
       document.body.classList.remove("is-busy");
     }
+  }
+}
+
+function showDemProgress(percent, label) {
+  if (!demProgressOn) {
+    demProgressOn = true;
+    setBusy(true, label || "Downloading DEM…");
+  } else if (label && busyText) {
+    busyText.textContent = label;
+  }
+  if (busyEl) busyEl.classList.add("is-progress");
+  const pct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  if (busyBarFill) busyBarFill.style.width = `${pct}%`;
+  if (busyPct) {
+    busyPct.hidden = false;
+    busyPct.textContent = `${pct}%`;
+  }
+  if (busyBar) busyBar.hidden = false;
+}
+
+function hideDemProgress() {
+  if (busyBarFill) busyBarFill.style.width = "0%";
+  if (busyPct) busyPct.hidden = true;
+  if (busyBar) busyBar.hidden = true;
+  if (busyEl) busyEl.classList.remove("is-progress");
+  if (demProgressOn) {
+    demProgressOn = false;
+    setBusy(false);
   }
 }
 
@@ -271,7 +334,10 @@ function refreshLegend() {
     items.push({ swatch: "river", label: "River centreline (drawing…)" });
   }
   if (demOverlay) {
-    items.push({ swatch: "dem", label: "LiDAR DEM (50% opacity)" });
+    items.push({
+      swatch: "dem",
+      label: `LiDAR DEM (${Math.round(demTransparency)}% transparent)`,
+    });
   }
   if (ranTransects) {
     const spacing = Number(runForm.interval.value);
@@ -288,6 +354,7 @@ function refreshLegend() {
     });
   }
   setLegend(items);
+  syncDemOpacityControl();
 }
 
 function updateLayoutPreview() {
@@ -361,6 +428,33 @@ function scheduleDemPreview() {
   demPreviewTimer = setTimeout(refreshDemOverlay, 700);
 }
 
+async function readPreviewStream(res) {
+  if (!res.body || !res.body.getReader) {
+    return res.json();
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let last = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      last = JSON.parse(line);
+      if (last.percent != null) showDemProgress(last.percent, last.message);
+    }
+  }
+  if (buf.trim()) {
+    last = JSON.parse(buf);
+    if (last && last.percent != null) showDemProgress(last.percent, last.message);
+  }
+  return last || {};
+}
+
 async function refreshDemOverlay() {
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
@@ -383,24 +477,26 @@ async function refreshDemOverlay() {
   body.set("dem_source", source);
   body.set("along", alongInput.value || "300");
   body.set("length", runForm.length.value);
+  body.set("stream", "1");
   if (source === "upload") {
     body.set("dem", upload.files[0]);
   }
-  setBusy(true, "Loading DEM…");
+  showDemProgress(0, "Downloading DEM…");
   try {
-    const res = await fetch("/api/dem-preview", { method: "POST", body });
-    const data = await res.json();
+    const res = await fetch("/api/dem-preview?stream=1", { method: "POST", body });
+    const data = await readPreviewStream(res);
     if (seq !== demPreviewSeq) return;
-    if (!res.ok || !data.png || !data.bounds) {
+    if (!res.ok || data.error || !data.png || !data.bounds) {
       clearDemOverlay();
       lastPreviewKey = "";
+      if (data.error) setStatus(data.error, "error");
       return;
     }
     const bytes = Uint8Array.from(atob(data.png), (ch) => ch.charCodeAt(0));
     clearDemOverlay();
     demOverlayUrl = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
     demOverlay = L.imageOverlay(demOverlayUrl, data.bounds, {
-      opacity: 0.5,
+      opacity: demOverlayOpacity(),
       pane: "demPane",
       interactive: false,
       className: "dem-overlay",
@@ -412,7 +508,7 @@ async function refreshDemOverlay() {
     clearDemOverlay();
     lastPreviewKey = "";
   } finally {
-    setBusy(false);
+    if (seq === demPreviewSeq) hideDemProgress();
   }
 }
 
@@ -1160,6 +1256,19 @@ stopBtn.addEventListener("click", async () => {
   }
   if (abort) abort.abort();
 });
+
+if (demOpacityInput) {
+  demOpacityInput.addEventListener("input", () => {
+    demTransparency = Math.max(0, Math.min(100, Number(demOpacityInput.value) || 0));
+    try {
+      localStorage.setItem("hydroscreen-dem-transparency", String(Math.round(demTransparency)));
+    } catch (_err) {
+      /* ignore */
+    }
+    applyDemTransparency();
+  });
+}
+syncDemOpacityControl();
 
 window.addEventListener("resize", () => {
   if (!xsViewer.hidden && xsProfile) drawXsProfile(xsProfile);
