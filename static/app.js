@@ -41,10 +41,65 @@ const map = L.map("map", { doubleClickZoom: false }).setView(
   [CHRISTCHURCH.lat, CHRISTCHURCH.lon],
   CHRISTCHURCH.zoom
 );
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  attribution: "&copy; OpenStreetMap",
-}).addTo(map);
+
+function googleBasemap(lyrs) {
+  return L.tileLayer("https://{s}.google.com/vt/lyrs=" + lyrs + "&x={x}&y={y}&z={z}", {
+    maxZoom: 21,
+    subdomains: ["mt0", "mt1", "mt2", "mt3"],
+    attribution: "&copy; Google",
+  });
+}
+
+const BASEMAPS = {
+  map: googleBasemap("m"),
+  earth: googleBasemap("y"),
+  topo: googleBasemap("p"),
+};
+const BASEMAP_IDS = ["map", "earth", "topo"];
+const BASEMAP_LABELS = {
+  map: "Google Map",
+  earth: "Google Earth",
+  topo: "Google Topo",
+};
+let currentBasemapId = "map";
+try {
+  const saved = localStorage.getItem("hydroscreen-basemap");
+  if (BASEMAP_IDS.includes(saved)) currentBasemapId = saved;
+} catch (_err) {
+  /* ignore */
+}
+BASEMAPS[currentBasemapId].addTo(map);
+
+function syncBasemapButtons() {
+  document.querySelectorAll("[data-basemap]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.dataset.basemap === currentBasemapId ? "true" : "false");
+  });
+}
+
+function setBasemap(id) {
+  if (!BASEMAPS[id] || id === currentBasemapId) {
+    syncBasemapButtons();
+    refreshLegend();
+    return;
+  }
+  map.removeLayer(BASEMAPS[currentBasemapId]);
+  currentBasemapId = id;
+  BASEMAPS[id].addTo(map);
+  BASEMAPS[id].bringToBack();
+  try {
+    localStorage.setItem("hydroscreen-basemap", id);
+  } catch (_err) {
+    /* ignore */
+  }
+  syncBasemapButtons();
+  refreshLegend();
+}
+
+document.querySelectorAll("[data-basemap]").forEach((btn) => {
+  btn.addEventListener("click", () => setBasemap(btn.dataset.basemap));
+});
+syncBasemapButtons();
+
 map.createPane("demPane");
 map.getPane("demPane").style.zIndex = 350;
 map.getPane("demPane").style.pointerEvents = "none";
@@ -141,7 +196,7 @@ function setLegend(items) {
 }
 
 function refreshLegend() {
-  const items = [{ swatch: "basemap", label: "OpenStreetMap" }];
+  const items = [{ swatch: `basemap ${currentBasemapId}`, label: BASEMAP_LABELS[currentBasemapId] }];
   if (marker && bridgeName) {
     items.push({ swatch: "bridge", label: `Bridge — ${bridgeName}` });
   }

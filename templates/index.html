@@ -41,10 +41,16 @@
     </div>
   </aside>
 
+  <div class="basemap-switch" role="radiogroup" aria-label="Basemap">
+    <button type="button" data-basemap="map" aria-pressed="true">Map</button>
+    <button type="button" data-basemap="earth" aria-pressed="false">Earth</button>
+    <button type="button" data-basemap="topo" aria-pressed="false">Topo</button>
+  </div>
+
   <aside id="legend" class="card legend">
     <h2>Legend</h2>
     <ul id="legend-list">
-      <li data-key="basemap"><span class="swatch basemap"></span> OpenStreetMap</li>
+      <li data-key="basemap"><span class="swatch basemap map"></span> Google Map</li>
     </ul>
   </aside>
 
@@ -221,6 +227,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=map-first"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=google-basemap"></script>
 </body>
 </html>
