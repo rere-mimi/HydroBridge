@@ -33,12 +33,13 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from shapely.geometry import Point, LineString, box
+from shapely.geometry import Point, LineString, Polygon, box, mapping
 from shapely.ops import split, nearest_points, substring
 from pyproj import Transformer
 
 try:
     import rasterio
+    from rasterio.features import geometry_mask
     from rasterio.merge import merge as raster_merge
     from rasterio.transform import from_origin, from_bounds
     from rasterio.warp import reproject, Resampling, transform_bounds
@@ -64,6 +65,9 @@ LINZ_HTTP_HEADERS = {"User-Agent": "HydroBridge/0.1"}
 LINZ_HTTP_TIMEOUT = (20, 120)
 DEM_CLIP_SIZE_M = 500.0
 DEM_CLIP_SNAP_M = 20.0
+AOI_DEFAULT_M = DEM_CLIP_SIZE_M / 2.0
+AOI_MIN_M = 10.0
+AOI_MAX_M = 5000.0
 MAX_DEM_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
 DEM_PREVIEW_MAX_PX = 640
 DEM_PREVIEW_MIN_RADIUS_M = DEM_CLIP_SIZE_M / 2.0
@@ -233,6 +237,199 @@ def square_clip_bbox_4326(lat, lon, size_m=None, snap_m=None):
     """WGS84 envelope of the NZTM square clip around the pin."""
     return bbox_4326_from_2193(square_clip_2193(lat, lon, size_m=size_m, snap_m=snap_m))
 
+
+def parse_aoi_extent(value, default=None, name="extent"):
+    """Parse an upstream, downstream, or lateral distance in metres."""
+    if value is None or value == "":
+        return float(AOI_DEFAULT_M if default is None else default)
+    try:
+        extent_m = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HydroScreenError(f"{name} must be a number.") from exc
+    if not math.isfinite(extent_m) or extent_m < AOI_MIN_M or extent_m > AOI_MAX_M:
+        raise HydroScreenError(
+            f"{name} must be between {int(AOI_MIN_M)} and {int(AOI_MAX_M)} m."
+        )
+    return extent_m
+
+
+def _unit_vector(dx, dy, fallback=(0.0, -1.0)):
+    mag = math.hypot(float(dx), float(dy))
+    if mag < 1e-9:
+        return (float(fallback[0]), float(fallback[1]))
+    return (float(dx) / mag, float(dy) / mag)
+
+
+def aoi_downstream_unit_2193(lat, lon, centerline_coords=None):
+    """NZTM unit vector pointing downstream.
+
+    Centreline forward (increasing station) is downstream. With no line, downstream
+    is NZTM south so the default 250/250/250 extents make a north-up 500 m square.
+    """
+    if not centerline_coords:
+        return (0.0, -1.0)
+    to_2193 = _transformer("EPSG:4326", "EPSG:2193")
+    bx, by = to_2193.transform(float(lon), float(lat))
+    pts = []
+    for pair in centerline_coords:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            pts.append(to_2193.transform(float(pair[0]), float(pair[1])))
+        except (TypeError, ValueError):
+            continue
+    if len(pts) < 2:
+        return (0.0, -1.0)
+    best = None
+    for index in range(len(pts) - 1):
+        x1, y1 = pts[index]
+        x2, y2 = pts[index + 1]
+        dx, dy = x2 - x1, y2 - y1
+        seg_len2 = dx * dx + dy * dy
+        if seg_len2 < 1e-12:
+            continue
+        t = ((bx - x1) * dx + (by - y1) * dy) / seg_len2
+        t = max(0.0, min(1.0, t))
+        px, py = x1 + t * dx, y1 + t * dy
+        dist2 = (px - bx) ** 2 + (py - by) ** 2
+        if best is None or dist2 < best[0]:
+            best = (dist2, dx, dy)
+    if best is None:
+        return (0.0, -1.0)
+    return _unit_vector(best[1], best[2])
+
+
+def _lonlat_from_2193(x, y):
+    lon, lat = _transformer("EPSG:2193", "EPSG:4326").transform(float(x), float(y))
+    return [float(lon), float(lat)]
+
+
+def bridge_aoi(
+    lat,
+    lon,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
+    snap_m=None,
+):
+    """Rectangle around the bridge pin from upstream, downstream, and lateral extents.
+
+    The pin is the centre. Edge midpoints (upstream, downstream, left, right looking
+    downstream) define a rectangle whose corners are connected as the area of interest.
+    """
+    upstream_m = parse_aoi_extent(upstream_m, name="Upstream limit")
+    downstream_m = parse_aoi_extent(downstream_m, name="Downstream limit")
+    lateral_m = parse_aoi_extent(lateral_m, name="Lateral extent")
+    snap_m = DEM_CLIP_SNAP_M if snap_m is None else float(snap_m)
+    x, y = _transformer("EPSG:4326", "EPSG:2193").transform(float(lon), float(lat))
+    if snap_m > 0:
+        x = round(x / snap_m) * snap_m
+        y = round(y / snap_m) * snap_m
+    down_x, down_y = aoi_downstream_unit_2193(lat, lon, centerline_coords)
+    right_x, right_y = down_y, -down_x
+    up_pt = (x - down_x * upstream_m, y - down_y * upstream_m)
+    down_pt = (x + down_x * downstream_m, y + down_y * downstream_m)
+    left_pt = (x - right_x * lateral_m, y - right_y * lateral_m)
+    right_pt = (x + right_x * lateral_m, y + right_y * lateral_m)
+    ul = (up_pt[0] - right_x * lateral_m, up_pt[1] - right_y * lateral_m)
+    ur = (up_pt[0] + right_x * lateral_m, up_pt[1] + right_y * lateral_m)
+    dr = (down_pt[0] + right_x * lateral_m, down_pt[1] + right_y * lateral_m)
+    dl = (down_pt[0] - right_x * lateral_m, down_pt[1] - right_y * lateral_m)
+    ring_2193 = [ul, ur, dr, dl, ul]
+    xs = [pt[0] for pt in ring_2193[:-1]]
+    ys = [pt[1] for pt in ring_2193[:-1]]
+    bounds_2193 = (min(xs), min(ys), max(xs), max(ys))
+    ring_4326 = [_lonlat_from_2193(px, py) for px, py in ring_2193]
+    along_m = upstream_m + downstream_m
+    width_m = 2.0 * lateral_m
+    return {
+        "lat": float(lat),
+        "lon": float(lon),
+        "origin_2193": (float(x), float(y)),
+        "downstream_unit_2193": (float(down_x), float(down_y)),
+        "upstream_m": float(upstream_m),
+        "downstream_m": float(downstream_m),
+        "lateral_m": float(lateral_m),
+        "along_m": float(along_m),
+        "width_m": float(width_m),
+        "clip_size_m": float(max(along_m, width_m)),
+        "points_2193": {
+            "upstream": (float(up_pt[0]), float(up_pt[1])),
+            "downstream": (float(down_pt[0]), float(down_pt[1])),
+            "left": (float(left_pt[0]), float(left_pt[1])),
+            "right": (float(right_pt[0]), float(right_pt[1])),
+        },
+        "corners_2193": {
+            "ul": (float(ul[0]), float(ul[1])),
+            "ur": (float(ur[0]), float(ur[1])),
+            "dr": (float(dr[0]), float(dr[1])),
+            "dl": (float(dl[0]), float(dl[1])),
+        },
+        "ring_2193": [(float(px), float(py)) for px, py in ring_2193],
+        "ring_4326": ring_4326,
+        "points_4326": {
+            "upstream": _lonlat_from_2193(*up_pt),
+            "downstream": _lonlat_from_2193(*down_pt),
+            "left": _lonlat_from_2193(*left_pt),
+            "right": _lonlat_from_2193(*right_pt),
+        },
+        "bounds_2193": tuple(float(v) for v in bounds_2193),
+        "bbox_4326": bbox_4326_from_2193(bounds_2193),
+    }
+
+
+def aoi_polygon_2193(aoi):
+    """Shapely polygon of an AOI ring in NZTM."""
+    ring = aoi.get("ring_2193") if isinstance(aoi, dict) else aoi
+    return Polygon(ring)
+
+
+def aoi_leaflet(aoi):
+    """Leaflet-friendly lat/lng ring and labelled edge points."""
+    def latlng(pair):
+        lon, lat = pair
+        return [float(lat), float(lon)]
+
+    return {
+        "ring": [latlng(pt) for pt in aoi["ring_4326"]],
+        "points": {name: latlng(pt) for name, pt in aoi["points_4326"].items()},
+        "upstream_m": aoi["upstream_m"],
+        "downstream_m": aoi["downstream_m"],
+        "lateral_m": aoi["lateral_m"],
+    }
+
+
+def _cache_file_for_aoi(aoi, resolution=None):
+    res = 0 if resolution is None else round(float(resolution), 2)
+    ox, oy = (round(float(v), 1) for v in aoi["origin_2193"])
+    dx, dy = (round(float(v), 4) for v in aoi["downstream_unit_2193"])
+    up = round(float(aoi["upstream_m"]), 1)
+    down = round(float(aoi["downstream_m"]), 1)
+    lateral = round(float(aoi["lateral_m"]), 1)
+    name = f"aoi_{ox:.1f}_{oy:.1f}_{dx:.4f}_{dy:.4f}_{up:.1f}_{down:.1f}_{lateral:.1f}_{res:g}.tif"
+    return dem_cache_dir() / name
+
+
+def _vsicurl_uri(url):
+    if url.startswith("/vsicurl/") or url.startswith("/vsi"):
+        return url
+    if url.startswith("http://") or url.startswith("https://"):
+        return f"/vsicurl/{url}"
+    return url
+
+
+def linz_window_uris(plan):
+    """Windowed HTTPS COGs, or a complete local sheet if one is already on disk."""
+    uris = []
+    for url, path in zip(plan.get("urls") or [], plan.get("paths") or []):
+        local = Path(path)
+        if local.exists() and local.stat().st_size > 256:
+            uris.append(str(local))
+        else:
+            uris.append(_vsicurl_uri(url))
+    return uris
+
 # DEM acquisition
 
 def download_wcs_getcoverage(wcs_base, layer, bbox, out_tif, crs="EPSG:4326", width=1024, height=1024):
@@ -351,31 +548,63 @@ def linz_tiles_for_bbox(bbox, tiles=None):
     return sorted(hits)
 
 
-def plan_linz_clip(lat, lon, size_m=None, snap_m=None):
-    """Choose LINZ 1 m tiles for the 500 m square around a bridge pin.
+def plan_linz_clip(
+    lat,
+    lon,
+    size_m=None,
+    snap_m=None,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
+):
+    """Choose LINZ 1 m tiles for the AOI rectangle around a bridge pin.
 
     Methodology:
     1. Project the pin to NZTM (EPSG:2193) and snap it so nearby clicks share a window.
-    2. Build a fixed 500 m × 500 m square in NZTM centred on that snap.
-    3. Convert the square to a WGS84 envelope.
-    4. Intersect that envelope with the bundled Topo50 index for LINZ layer 121859.
-    5. Return those sheet codes, public HTTPS URLs, and local download paths.
+    2. Build a rectangle from upstream, downstream, and lateral extents about the pin.
+       Heading follows the centreline (forward = downstream); otherwise NZTM north-up.
+    3. Convert that rectangle's envelope to a WGS84 bbox.
+    4. Intersect the bbox with the bundled Topo50 index for LINZ layer 121859.
+    5. Return sheet codes, public HTTPS COG URLs, and the AOI polygon used to crop.
 
-    Full intersecting GeoTIFFs are downloaded into outputs/linz-tiles/. The 500 m
-    bridge window is clipped from those local files, not cropped over HTTP.
+    Intersecting COGs are windowed over HTTPS to the AOI. A complete local sheet in
+    outputs/linz-tiles/ is reused when already on disk; whole tiles are not downloaded.
     """
-    bounds_2193 = square_clip_2193(lat, lon, size_m=size_m, snap_m=snap_m)
-    bbox_4326 = bbox_4326_from_2193(bounds_2193)
+    if size_m is not None and upstream_m is None and downstream_m is None and lateral_m is None:
+        half = float(size_m) / 2.0
+        upstream_m = downstream_m = lateral_m = half
+    aoi = bridge_aoi(
+        lat,
+        lon,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
+        snap_m=snap_m,
+    )
+    bounds_2193 = aoi["bounds_2193"]
+    bbox_4326 = aoi["bbox_4326"]
     tiles = linz_tiles_for_bbox(bbox_4326)
     urls = [linz_tile_url(code) for code in tiles]
     paths = [str(linz_tile_path(code)) for code in tiles]
-    clip_size = float(DEM_CLIP_SIZE_M if size_m is None else size_m)
     return {
         "lat": float(lat),
         "lon": float(lon),
-        "clip_size_m": clip_size,
+        "clip_size_m": float(aoi["clip_size_m"]),
+        "upstream_m": float(aoi["upstream_m"]),
+        "downstream_m": float(aoi["downstream_m"]),
+        "lateral_m": float(aoi["lateral_m"]),
+        "along_m": float(aoi["along_m"]),
+        "width_m": float(aoi["width_m"]),
+        "origin_2193": aoi["origin_2193"],
+        "downstream_unit_2193": aoi["downstream_unit_2193"],
         "bounds_2193": tuple(float(v) for v in bounds_2193),
         "bbox_4326": tuple(float(v) for v in bbox_4326),
+        "ring_2193": aoi["ring_2193"],
+        "ring_4326": aoi["ring_4326"],
+        "points_4326": aoi["points_4326"],
+        "aoi": aoi_leaflet(aoi),
         "tiles": tiles,
         "urls": urls,
         "uris": urls,
@@ -501,36 +730,46 @@ def ensure_linz_tiles(codes, progress=None):
     return paths
 
 
-def iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
-    """Identify tiles, download full sheets, then clip the 500 m bridge window locally."""
+def iter_extract_linz_dem_for_bridge(
+    lat,
+    lon,
+    out_tif,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
+):
+    """Identify intersecting COGs and crop the AOI window; do not download whole tiles."""
     yield {"percent": 2, "message": "Finding DEM tiles"}
-    plan = plan_linz_clip(lat, lon)
+    plan = plan_linz_clip(
+        lat,
+        lon,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
+    )
     if not plan["tiles"]:
         raise HydroScreenError(
             "This site is outside the New Zealand LiDAR 1m DEM coverage "
             f"({LINZ_LIDAR_1M_LAYER})."
         )
     logging.info(
-        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (%.0f m local clip)",
+        "Bridge %.5f, %.5f uses LINZ 1m sheets %s (AOI %.0f m along × %.0f m wide)",
         plan["lat"],
         plan["lon"],
         ", ".join(plan["tiles"]),
-        plan["clip_size_m"],
+        plan["along_m"],
+        plan["width_m"],
     )
-    n = len(plan["tiles"])
+    sheets = ", ".join(plan["tiles"])
     yield {
-        "percent": 5,
-        "message": f"Downloading {', '.join(plan['tiles'])}",
+        "percent": 8,
+        "message": f"Cropping {sheets} to the area of interest",
         "plan": plan,
     }
-    for index, code in enumerate(plan["tiles"]):
-        for frac, message in iter_download_linz_tile(code):
-            overall = 5 + ((index + max(0.0, min(1.0, float(frac)))) / n) * 80
-            yield {"percent": int(round(overall)), "message": message, "plan": plan}
-    paths = [str(linz_tile_path(code)) for code in plan["tiles"]]
-    yield {"percent": 86, "message": "Clipping DEM to the bridge area", "plan": plan}
 
-    cache_file = _cache_file_for(plan["bbox_4326"], None, bounds_2193=plan["bounds_2193"])
+    cache_file = _cache_file_for_aoi(plan)
     out_path = Path(out_tif)
     with _CACHE_LOCK:
         if cache_file.exists() and cache_file.stat().st_size > 256:
@@ -546,8 +785,15 @@ def iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
             }
             return
 
+    uris = linz_window_uris(plan)
+    yield {"percent": 12, "message": "Clipping DEM to the area of interest", "plan": plan}
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    clip_dem_tiles(paths, plan["bounds_2193"], str(out_path))
+    clip_dem_tiles(
+        uris,
+        plan["bounds_2193"],
+        str(out_path),
+        geometry=aoi_polygon_2193(plan),
+    )
     with _CACHE_LOCK:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -559,11 +805,28 @@ def iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
     yield {"percent": 100, "message": "DEM ready", "path": str(out_path), "plan": plan}
 
 
-def extract_linz_dem_for_bridge(lat, lon, out_tif, progress=None):
-    """Download intersecting LINZ sheets, then clip 500 m locally. Returns (path, plan)."""
+def extract_linz_dem_for_bridge(
+    lat,
+    lon,
+    out_tif,
+    progress=None,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
+):
+    """Crop intersecting LINZ COGs to the AOI rectangle. Returns (path, plan)."""
     path = None
     plan = None
-    for event in iter_extract_linz_dem_for_bridge(lat, lon, out_tif):
+    for event in iter_extract_linz_dem_for_bridge(
+        lat,
+        lon,
+        out_tif,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
+    ):
         plan = event.get("plan") or plan
         if progress is not None and "percent" in event:
             _emit_progress(progress, event["percent"] / 100.0, event.get("message"))
@@ -578,8 +841,20 @@ def _emit_progress(progress, fraction, message=None):
     progress(max(0.0, min(1.0, float(fraction))), message)
 
 
-def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=None, progress=None):
-    """Mosaic windowed reads from GeoTIFF URIs into an NZTM clip."""
+def clip_dem_tiles(
+    tile_uris,
+    bounds_2193,
+    out_tif,
+    nodata=-9999.0,
+    resolution=None,
+    progress=None,
+    geometry=None,
+):
+    """Mosaic windowed reads from GeoTIFF URIs into an NZTM clip.
+
+    When geometry is set (a Shapely polygon or GeoJSON mapping in EPSG:2193),
+    pixels outside that polygon are written as nodata.
+    """
     _configure_gdal_http()
     west, south, east, north = bounds_2193
     if east <= west or north <= south:
@@ -588,10 +863,11 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
     try:
         _emit_progress(progress, 0.04, "Opening DEM tiles")
         for uri in tile_uris:
+            open_uri = _vsicurl_uri(str(uri))
             try:
-                datasets.append(rasterio.open(uri))
+                datasets.append(rasterio.open(open_uri))
             except Exception as exc:
-                if "/vsicurl/" in str(uri):
+                if str(open_uri).startswith("/vsicurl/") or str(uri).startswith("http"):
                     raise HydroScreenError(
                         "Could not open the New Zealand LiDAR 1m DEM. "
                         f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
@@ -599,7 +875,7 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
                 raise
         if not datasets:
             raise HydroScreenError("No DEM tiles were available to clip.")
-        _emit_progress(progress, 0.12, "Downloading DEM")
+        _emit_progress(progress, 0.12, "Cropping DEM")
         merge_kw = {
             "bounds": (west, south, east, north),
             "nodata": nodata,
@@ -608,6 +884,16 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
             merge_kw["res"] = (float(resolution), float(resolution))
         mosaic, transform = raster_merge(datasets, **merge_kw)
         data = mosaic[0]
+        if geometry is not None:
+            geom = mapping(geometry) if hasattr(geometry, "__geo_interface__") else geometry
+            outside = geometry_mask(
+                [geom],
+                out_shape=data.shape,
+                transform=transform,
+                invert=False,
+            )
+            data = np.array(data, copy=True)
+            data[outside] = nodata
         valid = np.isfinite(data) & (data != nodata)
         if not np.any(valid):
             raise HydroScreenError(
@@ -637,11 +923,11 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
 
 
 def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, progress=None):
-    """Download intersecting LINZ sheets, then clip locally around bbox.
+    """Window intersecting LINZ COGs to bbox. Does not download whole Topo50 sheets.
 
     When bounds_2193 is set, the GeoTIFF is clipped to that exact NZTM window
-    (used for the 500 m site square) and is not grown for cache snapping.
-    Full sheets are stored under outputs/linz-tiles/; only the clip is cached.
+    and is not grown for cache snapping. A complete local sheet is reused when
+    already on disk.
     """
     if bounds_2193 is None:
         bbox = expand_bbox_for_cache(bbox)
@@ -649,22 +935,6 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
     out_path = Path(out_tif)
 
     _emit_progress(progress, 0.04, "Finding DEM tiles")
-    codes = linz_tiles_for_bbox(bbox)
-    if not codes:
-        raise HydroScreenError(
-            "This site is outside the New Zealand LiDAR 1m DEM coverage "
-            f"({LINZ_LIDAR_1M_LAYER})."
-        )
-    logging.info(
-        "Downloading New Zealand LiDAR 1m DEM sheets %s, then clipping locally",
-        ", ".join(codes),
-    )
-
-    def on_download(frac, message=None):
-        _emit_progress(progress, 0.05 + 0.75 * float(frac), message)
-
-    local_paths = ensure_linz_tiles(codes, progress=on_download)
-
     with _CACHE_LOCK:
         if cache_file.exists() and cache_file.stat().st_size > 256:
             logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
@@ -674,6 +944,24 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
                 shutil.copyfile(cache_file, out_path)
             _emit_progress(progress, 1.0, "DEM ready")
             return str(out_path)
+
+    codes = linz_tiles_for_bbox(bbox)
+    if not codes:
+        raise HydroScreenError(
+            "This site is outside the New Zealand LiDAR 1m DEM coverage "
+            f"({LINZ_LIDAR_1M_LAYER})."
+        )
+    logging.info(
+        "Cropping New Zealand LiDAR 1m DEM sheets %s to the requested window",
+        ", ".join(codes),
+    )
+    uris = []
+    for code in codes:
+        local = linz_tile_path(code)
+        if local.exists() and local.stat().st_size > 256:
+            uris.append(str(local))
+        else:
+            uris.append(_vsicurl_uri(linz_tile_url(code)))
 
     if bounds_2193 is not None:
         west, south, east, north = (float(v) for v in bounds_2193)
@@ -686,11 +974,11 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
         south, north = min(y1, y2) - 2.0, max(y1, y2) + 2.0
 
     def on_clip(frac, message=None):
-        _emit_progress(progress, 0.82 + 0.18 * float(frac), message)
+        _emit_progress(progress, 0.12 + 0.88 * float(frac), message)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     clip_dem_tiles(
-        local_paths,
+        uris,
         (west, south, east, north),
         str(out_path),
         resolution=resolution,
@@ -707,9 +995,12 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, pro
     return str(out_path)
 
 
-def screening_dem_radius_m(buffer, along_m, length):
-    """Half-side of the site DEM clip. Window size is fixed; args kept for callers."""
-    return DEM_CLIP_SIZE_M / 2.0
+def screening_dem_radius_m(buffer, along_m, length, upstream_m=None, downstream_m=None, lateral_m=None):
+    """Half-extent of the site DEM clip (largest of upstream, downstream, lateral)."""
+    up = parse_aoi_extent(upstream_m)
+    down = parse_aoi_extent(downstream_m)
+    side = parse_aoi_extent(lateral_m)
+    return max(up, down, side)
 
 
 def _colorize_elevation(z):
@@ -773,42 +1064,76 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
     return buf.getvalue(), (west, south, east, north)
 
 
-def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
+def iter_dem_preview(
+    lat,
+    lon,
+    dem_path=None,
+    along_m=300.0,
+    length=200.0,
+    buffer=200.0,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
+):
     """Yield progress events, then a final overlay result with png/bounds."""
     _ = (along_m, length, buffer)
     yield {"percent": 0, "message": "Finding DEM tiles"}
-    bounds_2193 = square_clip_2193(lat, lon)
-    bbox = bbox_4326_from_2193(bounds_2193)
-    radius = DEM_CLIP_SIZE_M / 2.0
+    plan = plan_linz_clip(
+        lat,
+        lon,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
+    )
+    bounds_2193 = plan["bounds_2193"]
+    bbox = plan["bbox_4326"]
+    radius = screening_dem_radius_m(
+        buffer, along_m, length,
+        upstream_m=plan["upstream_m"],
+        downstream_m=plan["downstream_m"],
+        lateral_m=plan["lateral_m"],
+    )
     temp_dir = None
     src_path = dem_path
     source = "local"
     linz_tiles = []
+    aoi = plan.get("aoi")
     try:
         if src_path is None:
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
-            plan = None
+            used = None
             try:
-                for event in iter_extract_linz_dem_for_bridge(lat, lon, src_path):
+                for event in iter_extract_linz_dem_for_bridge(
+                    lat,
+                    lon,
+                    src_path,
+                    upstream_m=upstream_m,
+                    downstream_m=downstream_m,
+                    lateral_m=lateral_m,
+                    centerline_coords=centerline_coords,
+                ):
                     yield {
                         "percent": int(event.get("percent") or 0),
-                        "message": event.get("message") or "Downloading DEM…",
+                        "message": event.get("message") or "Cropping DEM…",
                     }
                     if event.get("path"):
                         src_path = event["path"]
                     if event.get("plan"):
-                        plan = event["plan"]
+                        used = event["plan"]
             except HydroScreenError:
                 raise
             except Exception as exc:
-                logging.exception("LINZ 1m DEM download failed")
+                logging.exception("LINZ 1m DEM crop failed")
                 raise HydroScreenError(
-                    "Could not download the New Zealand LiDAR 1m DEM. "
+                    "Could not crop the New Zealand LiDAR 1m DEM. "
                     f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
                 ) from exc
             source = "linz-lidar-1m"
-            linz_tiles = list((plan or {}).get("tiles") or [])
+            linz_tiles = list((used or plan).get("tiles") or [])
+            aoi = (used or plan).get("aoi") or aoi
             yield {"percent": 92, "message": "Drawing DEM overlay"}
         else:
             yield {"percent": 40, "message": "Reading DEM"}
@@ -821,8 +1146,12 @@ def iter_dem_preview(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffe
             "bounds": bounds,
             "source": source,
             "radius_m": float(radius),
-            "clip_size_m": DEM_CLIP_SIZE_M,
+            "clip_size_m": float(plan["clip_size_m"]),
+            "upstream_m": float(plan["upstream_m"]),
+            "downstream_m": float(plan["downstream_m"]),
+            "lateral_m": float(plan["lateral_m"]),
             "tiles": list(linz_tiles),
+            "aoi": aoi,
         }
     finally:
         if temp_dir:
@@ -837,11 +1166,24 @@ def preview_dem_overlay(
     length=200.0,
     buffer=200.0,
     progress=None,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
 ):
     """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
     result = None
     for event in iter_dem_preview(
-        lat, lon, dem_path=dem_path, along_m=along_m, length=length, buffer=buffer
+        lat,
+        lon,
+        dem_path=dem_path,
+        along_m=along_m,
+        length=length,
+        buffer=buffer,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
     ):
         if progress is not None and "percent" in event:
             _emit_progress(progress, event["percent"] / 100.0, event.get("message"))
@@ -852,7 +1194,11 @@ def preview_dem_overlay(
                 "source": event["source"],
                 "radius_m": event["radius_m"],
                 "clip_size_m": event["clip_size_m"],
+                "upstream_m": event.get("upstream_m"),
+                "downstream_m": event.get("downstream_m"),
+                "lateral_m": event.get("lateral_m"),
                 "tiles": event.get("tiles") or [],
+                "aoi": event.get("aoi"),
             }
     return result
 
@@ -1171,6 +1517,10 @@ def sample_drawn_cross_section(
     spacing_m=1.0,
     site_lat=None,
     site_lon=None,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
+    centerline_coords=None,
 ):
     """Sample DEM elevations along a two-point line and return a JSON-ready profile."""
     try:
@@ -1203,7 +1553,15 @@ def sample_drawn_cross_section(
                 clip_lon = 0.5 * (lon1 + lon2)
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_xs_")
             dem_path = os.path.join(temp_dir, "dem.tif")
-            dem_path, _plan = extract_linz_dem_for_bridge(clip_lat, clip_lon, dem_path)
+            dem_path, _plan = extract_linz_dem_for_bridge(
+                clip_lat,
+                clip_lon,
+                dem_path,
+                upstream_m=upstream_m,
+                downstream_m=downstream_m,
+                lateral_m=lateral_m,
+                centerline_coords=centerline_coords,
+            )
             source = "linz-lidar-1m"
         dists, elevs, _coords = sample_dem_along_line(dem_path, line, spacing_m=spacing_m)
         finite = elevs[np.isfinite(elevs)]
@@ -1632,6 +1990,9 @@ def run_screening(
     sample_spacing=1.0,
     centerline_coords=None,
     cancel_event=None,
+    upstream_m=None,
+    downstream_m=None,
+    lateral_m=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
     outdir = Path(outdir)
@@ -1671,9 +2032,23 @@ def run_screening(
     dem_source_used = "local"
     kept_dem = None
     linz_tiles = []
-    bounds_2193 = square_clip_2193(lat, lon)
-    bbox = bbox_4326_from_2193(bounds_2193)
-    buffer_m = DEM_CLIP_SIZE_M / 2.0
+    plan = plan_linz_clip(
+        lat,
+        lon,
+        upstream_m=upstream_m,
+        downstream_m=downstream_m,
+        lateral_m=lateral_m,
+        centerline_coords=centerline_coords,
+    )
+    bbox = plan["bbox_4326"]
+    buffer_m = screening_dem_radius_m(
+        buffer,
+        along_m,
+        length,
+        upstream_m=plan["upstream_m"],
+        downstream_m=plan["downstream_m"],
+        lateral_m=plan["lateral_m"],
+    )
 
     if dem_path is None:
         check_cancelled(cancel_event)
@@ -1694,29 +2069,35 @@ def run_screening(
                 )
         if dem_path is None:
             logging.info(
-                "Downloading New Zealand LiDAR 1m DEM around the site, then clipping locally "
-                "(%sm × %sm)",
-                int(DEM_CLIP_SIZE_M),
-                int(DEM_CLIP_SIZE_M),
+                "Cropping New Zealand LiDAR 1m DEM to the area of interest "
+                "(%.0f m along × %.0f m wide)",
+                plan["along_m"],
+                plan["width_m"],
             )
-            # Full-tile download and the local 500 m clip stay on this request
-            # thread so Stop can still interrupt between sheets.
-            cache_file = _cache_file_for(bbox, None, bounds_2193=bounds_2193)
+            cache_file = _cache_file_for_aoi(plan)
             try:
                 check_cancelled(cancel_event)
-                dem_path, plan = extract_linz_dem_for_bridge(lat, lon, str(cache_file))
+                dem_path, plan = extract_linz_dem_for_bridge(
+                    lat,
+                    lon,
+                    str(cache_file),
+                    upstream_m=upstream_m,
+                    downstream_m=downstream_m,
+                    lateral_m=lateral_m,
+                    centerline_coords=centerline_coords,
+                )
                 linz_tiles = plan["tiles"]
                 dem_source_used = "linz-lidar-1m"
                 check_cancelled(cancel_event)
             except HydroScreenError:
                 raise
             except Exception as exc:
-                logging.exception("LINZ 1m DEM download failed")
+                logging.exception("LINZ 1m DEM crop failed")
                 raise HydroScreenError(
-                    "Could not download the New Zealand LiDAR 1m DEM. "
+                    "Could not crop the New Zealand LiDAR 1m DEM. "
                     f"Check network access to LINZ open data ({LINZ_LIDAR_1M_LAYER})."
                 ) from exc
-            kept_dem = Path(outdir) / "dem_500m.tif"
+            kept_dem = Path(outdir) / "dem_aoi.tif"
             try:
                 if Path(dem_path).resolve() != kept_dem.resolve():
                     shutil.copyfile(dem_path, kept_dem)
@@ -1928,7 +2309,11 @@ def run_screening(
             "dem_layer": LINZ_LIDAR_1M_LAYER if dem_source_used == "linz-lidar-1m" else None,
             "dem_buffer_m": float(buffer_m),
             "dem_file": kept_dem.name if kept_dem else None,
-            "clip_size_m": float(DEM_CLIP_SIZE_M),
+            "clip_size_m": float(plan["clip_size_m"]),
+            "upstream_m": float(plan["upstream_m"]),
+            "downstream_m": float(plan["downstream_m"]),
+            "lateral_m": float(plan["lateral_m"]),
+            "aoi": plan.get("aoi"),
             "tiles": list(linz_tiles),
         },
         "temp_dem": temp_dir,
@@ -1943,7 +2328,9 @@ def main():
     parser.add_argument('--wcs_base', type=str, default=None, help='LINZ WCS base URL (optional)')
     parser.add_argument('--wcs_layer', type=str, default=None, help='WCS layer/coverage id (optional)')
     parser.add_argument('--outdir', type=str, default='outputs', help='Output directory')
-    parser.add_argument('--buffer', type=float, default=200.0, help='Buffer around point for DEM download (m) (min 200 m enforced)')
+    parser.add_argument('--upstream', type=float, default=AOI_DEFAULT_M, help='Upstream DEM extent from the bridge (m)')
+    parser.add_argument('--downstream', type=float, default=AOI_DEFAULT_M, help='Downstream DEM extent from the bridge (m)')
+    parser.add_argument('--lateral', type=float, default=AOI_DEFAULT_M, help='Left/right DEM extent from the bridge (m)')
     parser.add_argument('--interval', type=float, default=50.0, help='Spacing between transects along the river (m)')
     parser.add_argument('--along', type=float, default=300.0, help='Total length along the river to cover, centred on the bridge (m)')
     parser.add_argument('--n_each_side', type=int, default=None, help='Deprecated: number of transects each side of the bridge')
@@ -1963,7 +2350,6 @@ def main():
             wcs_base=args.wcs_base,
             wcs_layer=args.wcs_layer,
             outdir=args.outdir,
-            buffer=args.buffer,
             interval=args.interval,
             n_each_side=args.n_each_side if args.n_each_side is not None else 3,
             length=args.length,
@@ -1971,6 +2357,9 @@ def main():
             sample_spacing=args.sample_spacing,
             mannings_n=args.mannings_n,
             flow_m3_s=args.flow,
+            upstream_m=args.upstream,
+            downstream_m=args.downstream,
+            lateral_m=args.lateral,
         )
     except HydroScreenError as exc:
         logging.error("%s", exc)

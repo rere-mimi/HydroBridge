@@ -19,6 +19,7 @@ from hydroscreen import (
     HydroScreenError,
     iter_dem_preview,
     normalize_flow_scenarios,
+    parse_aoi_extent,
     preview_dem_overlay,
     run_screening,
     sample_drawn_cross_section,
@@ -119,6 +120,31 @@ def reverse_geocode():
         return jsonify({"label": None})
 
 
+def _parse_centerline(raw):
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HydroScreenError("The drawn river line could not be read. Clear it and draw again.")
+    if not isinstance(parsed, list):
+        raise HydroScreenError("The river centreline must be a list of points.")
+    if len(parsed) > 500:
+        raise HydroScreenError("The drawn river line has too many points. Clear it and draw a simpler line.")
+    if len(parsed) < 2:
+        return None
+    return parsed
+
+
+def _parse_aoi(src):
+    return {
+        "upstream_m": parse_aoi_extent(src.get("upstream"), name="Upstream limit"),
+        "downstream_m": parse_aoi_extent(src.get("downstream"), name="Downstream limit"),
+        "lateral_m": parse_aoi_extent(src.get("lateral"), name="Lateral extent"),
+        "centerline_coords": _parse_centerline((src.get("centerline") or "").strip()),
+    }
+
+
 def _preview_payload(result):
     west, south, east, north = result["bounds"]
     return {
@@ -127,7 +153,11 @@ def _preview_payload(result):
         "source": result["source"],
         "radius_m": result["radius_m"],
         "clip_size_m": result.get("clip_size_m"),
+        "upstream_m": result.get("upstream_m"),
+        "downstream_m": result.get("downstream_m"),
+        "lateral_m": result.get("lateral_m"),
         "tiles": result.get("tiles") or [],
+        "aoi": result.get("aoi"),
     }
 
 
@@ -148,12 +178,22 @@ def dem_preview():
         return jsonify({"error": "Screening options must be numbers."}), 400
     if along_m < 0 or length <= 0:
         return jsonify({"error": "Transect length and length along the river must be greater than 0."}), 400
+    try:
+        aoi = _parse_aoi(src)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     stream = (src.get("stream") or request.args.get("stream") or "").strip() == "1"
     if stream:
         def generate():
             try:
-                for event in iter_dem_preview(lat, lon, along_m=along_m, length=length):
+                for event in iter_dem_preview(
+                    lat,
+                    lon,
+                    along_m=along_m,
+                    length=length,
+                    **aoi,
+                ):
                     if event.get("done"):
                         payload = _preview_payload(event)
                         payload["percent"] = 100
@@ -185,7 +225,7 @@ def dem_preview():
         )
 
     try:
-        result = preview_dem_overlay(lat, lon, along_m=along_m, length=length)
+        result = preview_dem_overlay(lat, lon, along_m=along_m, length=length, **aoi)
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -228,6 +268,11 @@ def cross_section():
         site_lat = site_lon = None
 
     try:
+        aoi = _parse_aoi(request.form)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
         profile = sample_drawn_cross_section(
             lon1,
             lat1,
@@ -236,6 +281,7 @@ def cross_section():
             spacing_m=spacing,
             site_lat=site_lat,
             site_lon=site_lon,
+            **aoi,
         )
     except HydroScreenError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -287,18 +333,14 @@ def run():
         return jsonify({"error": str(exc)}), 400
     flow_m3_s = flow_scenarios[0]["flow_m3_s"]
 
-    centerline_coords = None
-    raw_centerline = (request.form.get("centerline") or "").strip()
-    if raw_centerline:
-        try:
-            parsed = json.loads(raw_centerline)
-        except json.JSONDecodeError:
-            return jsonify({"error": "The drawn river line could not be read. Clear it and draw again."}), 400
-        if not isinstance(parsed, list):
-            return jsonify({"error": "The river centreline must be a list of points."}), 400
-        if len(parsed) > 500:
-            return jsonify({"error": "The drawn river line has too many points. Clear it and draw a simpler line."}), 400
-        centerline_coords = parsed
+    try:
+        aoi = _parse_aoi(request.form)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    centerline_coords = aoi["centerline_coords"]
+    if (request.form.get("centerline") or "").strip() and centerline_coords is None:
+        return jsonify({"error": "The drawn river line is too short. Add more points along the channel."}), 400
 
     job_id = _parse_job_id() or secrets.token_hex(8)
     cancel_event = threading.Event()
@@ -318,6 +360,9 @@ def run():
             flow_scenarios=flow_scenarios,
             centerline_coords=centerline_coords,
             cancel_event=cancel_event,
+            upstream_m=aoi["upstream_m"],
+            downstream_m=aoi["downstream_m"],
+            lateral_m=aoi["lateral_m"],
         )
     except HydroScreenCancelled:
         return jsonify({"cancelled": True, "error": "Screening stopped."}), 409

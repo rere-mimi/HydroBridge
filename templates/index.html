@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HydroBridge</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=xs-measure">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=aoi-fit">
 </head>
 <body>
   <div class="app-frame">
@@ -82,7 +82,7 @@
   <form id="run-form" class="card params rail rail-end" hidden novalidate>
     <div class="params-head">
       <h2>Hydrology</h2>
-      <p id="bridge-summary" class="muted">Name a bridge, then draw its river centreline.</p>
+      <p id="bridge-summary" class="muted">Name a bridge, then set the DEM area of interest and draw its river centreline.</p>
     </div>
 
     <p class="analysis">
@@ -92,9 +92,39 @@
     </p>
     <p id="layout-preview" class="muted">Draw the centreline to set transect count.</p>
 
+    <fieldset class="field aoi-field">
+      <legend class="field-label">
+        DEM area of interest
+        <button type="button" class="help" aria-label="What is the DEM area of interest?" data-help="help-aoi">?</button>
+      </legend>
+      <span id="help-aoi" class="help-pop" role="tooltip" hidden>
+        The bridge pin is the centre. Upstream, downstream, and lateral distances define four edge points. Those points form a rectangle. HydroBridge crops that window from the LINZ 1 m LiDAR tiles instead of downloading whole Topo50 sheets.
+      </span>
+      <p class="muted">Distances from the pin. The rectangle rotates to the centreline (downstream is forward) or sits north-up until a line is drawn.</p>
+      <label class="field">
+        <span class="field-label">Upstream limit</span>
+        <span class="unit-field">
+          <input name="upstream" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+      <label class="field">
+        <span class="field-label">Downstream limit</span>
+        <span class="unit-field">
+          <input name="downstream" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+      <label class="field">
+        <span class="field-label">Lateral extent</span>
+        <span class="unit-field">
+          <input name="lateral" type="number" step="1" min="10" max="5000" value="250">
+          <span>m</span>
+        </span>
+      </label>
+    </fieldset>
+
     <label class="field">
-      <span class="field-label">
-        Transect length
         <button type="button" class="help" aria-label="What is transect length?" data-help="help-length">?</button>
       </span>
       <span class="unit-field">
@@ -208,10 +238,10 @@
         Elevation data
         <button type="button" class="help" aria-label="What elevation data is used?" data-help="help-dem">?</button>
       </span>
-      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ 121859). HydroBridge identifies the Topo50 tiles the 500 m bridge square touches, downloads those full GeoTIFFs into outputs/linz-tiles, then clips the window locally.</p>
+      <p class="muted" id="dem-source-note">New Zealand LiDAR 1 m DEM (LINZ 121859). HydroBridge crops the area of interest from the Topo50 tiles the rectangle touches. Whole sheets are not downloaded.</p>
       <p class="muted" id="dem-tiles" hidden></p>
       <span id="help-dem" class="help-pop" role="tooltip" hidden>
-        When you pin a bridge, HydroBridge looks up the LINZ 1 m LiDAR sheets that intersect a 500 m NZTM square, saves those full tiles under outputs/linz-tiles/, then clips that square on disk. Screening uses the local 500 m GeoTIFF.
+        When you pin a bridge, HydroBridge builds a rectangle from the upstream, downstream, and lateral extents about the pin, looks up the LINZ 1 m LiDAR sheets that intersect that polygon, and windows those COGs to the rectangle. Screening uses the cropped GeoTIFF.
       </span>
     </div>
 
@@ -284,6 +314,6 @@
   <div id="xs-measure" class="xs-measure" hidden role="status" aria-live="polite">0.0 m</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=xs-measure"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=aoi-fit"></script>
 </body>
 </html>

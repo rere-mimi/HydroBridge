@@ -75,7 +75,7 @@ class CrossSectionApiTests(unittest.TestCase):
 
         fixture = Path(__file__).resolve().parent / "fixtures" / "sample_dem.tif"
 
-        def fake_extract(lat, lon, out_tif, progress=None):
+        def fake_extract(lat, lon, out_tif, progress=None, **kwargs):
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(fixture, out_tif)
             return str(out_tif), plan_linz_clip(lat, lon)

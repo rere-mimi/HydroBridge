@@ -72,7 +72,7 @@ class ScreeningLinzDownloadTests(unittest.TestCase):
         caller = threading.get_ident()
         seen = {}
 
-        def fake_extract(lat, lon, out_tif, progress=None):
+        def fake_extract(lat, lon, out_tif, progress=None, **kwargs):
             seen["ident"] = threading.get_ident()
             seen["out"] = out_tif
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
@@ -103,11 +103,11 @@ class ScreeningLinzDownloadTests(unittest.TestCase):
                         cancel_event=threading.Event(),
                     )
             self.assertEqual(seen["ident"], caller)
-            kept = Path(result["outdir"]) / "dem_500m.tif"
+            kept = Path(result["outdir"]) / "dem_aoi.tif"
             self.assertTrue(kept.exists())
             self.assertGreater(kept.stat().st_size, 256)
             self.assertEqual(result["layout"]["dem_source"], "linz-lidar-1m")
-            self.assertEqual(result["layout"]["dem_file"], "dem_500m.tif")
+            self.assertEqual(result["layout"]["dem_file"], "dem_aoi.tif")
             self.assertIn("BQ31", result["layout"]["tiles"])
             self.assertGreaterEqual(len(result["summary"]), 1)
 
