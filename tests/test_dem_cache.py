@@ -41,14 +41,18 @@ class LinzClipCacheTests(unittest.TestCase):
                 Path(out_tif).write_bytes(b"CLIPPED-DEM" * 40)
                 return out_tif
 
+            def fake_tiles(codes, progress=None):
+                return [f"{code}.tiff" for code in codes]
+
             with patch.dict(os.environ, {"HYDROBRIDGE_DEM_CACHE": str(cache)}):
-                with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
-                    first = download_linz_lidar_1m(
-                        (174.77, -41.29, 174.78, -41.28), str(out1)
-                    )
-                    second = download_linz_lidar_1m(
-                        (174.771, -41.289, 174.779, -41.281), str(out2)
-                    )
+                with patch("hydroscreen.ensure_linz_tiles", side_effect=fake_tiles):
+                    with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
+                        first = download_linz_lidar_1m(
+                            (174.77, -41.29, 174.78, -41.28), str(out1)
+                        )
+                        second = download_linz_lidar_1m(
+                            (174.771, -41.289, 174.779, -41.281), str(out2)
+                        )
             self.assertEqual(len(calls), 1)
             self.assertEqual(Path(first).read_bytes(), Path(second).read_bytes())
 
@@ -64,14 +68,18 @@ class LinzClipCacheTests(unittest.TestCase):
                 Path(out_tif).write_bytes(b"SQUARE-CLIP" * 40)
                 return out_tif
 
+            def fake_tiles(codes, progress=None):
+                return [f"{code}.tiff" for code in codes]
+
             bounds_a = square_clip_2193(-41.2865, 174.7762)
             bounds_b = square_clip_2193(-41.28655, 174.77625)
             bbox_a = square_clip_bbox_4326(-41.2865, 174.7762)
             bbox_b = square_clip_bbox_4326(-41.28655, 174.77625)
             with patch.dict(os.environ, {"HYDROBRIDGE_DEM_CACHE": str(cache)}):
-                with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
-                    download_linz_lidar_1m(bbox_a, str(out1), bounds_2193=bounds_a)
-                    download_linz_lidar_1m(bbox_b, str(out2), bounds_2193=bounds_b)
+                with patch("hydroscreen.ensure_linz_tiles", side_effect=fake_tiles):
+                    with patch("hydroscreen.clip_dem_tiles", side_effect=fake_clip):
+                        download_linz_lidar_1m(bbox_a, str(out1), bounds_2193=bounds_a)
+                        download_linz_lidar_1m(bbox_b, str(out2), bounds_2193=bounds_b)
             self.assertEqual(len(calls), 1)
             west, south, east, north = calls[0]
             self.assertAlmostEqual(east - west, 500.0, places=5)

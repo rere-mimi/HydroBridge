@@ -72,12 +72,13 @@ class ScreeningLinzDownloadTests(unittest.TestCase):
         caller = threading.get_ident()
         seen = {}
 
-        def fake_download(bbox, out_tif, resolution=None, bounds_2193=None, progress=None):
+        def fake_extract(lat, lon, out_tif, progress=None):
             seen["ident"] = threading.get_ident()
             seen["out"] = out_tif
             Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
             _write_sloped_dem(out_tif, west, north, res, height, width)
-            return str(out_tif)
+            from hydroscreen import plan_linz_clip
+            return str(out_tif), plan_linz_clip(lat, lon)
 
         lat = north - (height / 2) * res
         lon = west + (width / 2) * res
@@ -87,7 +88,7 @@ class ScreeningLinzDownloadTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"HYDROBRIDGE_DEM_CACHE": str(Path(tmp) / "cache")}):
-                with patch("hydroscreen.download_linz_lidar_1m", side_effect=fake_download):
+                with patch("hydroscreen.extract_linz_dem_for_bridge", side_effect=fake_extract):
                     result = run_screening(
                         lat=lat,
                         lon=lon,
