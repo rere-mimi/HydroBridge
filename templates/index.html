@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HydroBridge</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=aoi-fit">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=ari-summary">
 </head>
 <body>
   <div class="app-frame">
@@ -285,23 +285,22 @@
   <section id="results" class="results" hidden>
     <div class="results-head">
       <h2>Screening results</h2>
-      <a id="summary-link" href="#" hidden>Download summary.xlsx</a>
+      <div class="results-actions">
+        <button type="button" id="results-ari-toggle" class="ghost" hidden>Collapse return periods</button>
+        <a id="summary-link" href="#" hidden>Download summary.xlsx</a>
+      </div>
     </div>
     <p id="results-note" class="muted"></p>
-    <div class="table-wrap">
-      <table>
+    <div class="table-wrap results-scroll">
+      <table class="results-table" id="results-table">
         <thead>
           <tr>
             <th>Transect</th>
             <th>Offset (m)</th>
-            <th>Samples</th>
-            <th>Water level (m)</th>
-            <th>Max depth (m)</th>
-            <th>Width (m)</th>
-            <th>Area (m²)</th>
-            <th>Hyd. radius (m)</th>
+            <th>Return period</th>
+            <th>Flow (m³/s)</th>
+            <th>Water level (max depth) (m)</th>
             <th>Velocity (m/s)</th>
-            <th>Q (m³/s)</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -314,6 +313,6 @@
   <div id="xs-measure" class="xs-measure" hidden role="status" aria-live="polite">0.0 m</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=aoi-fit"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=ari-summary"></script>
 </body>
 </html>
