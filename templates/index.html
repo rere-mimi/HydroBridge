@@ -35,8 +35,8 @@
       <button type="button" id="finish-line" class="secondary" disabled>Finish centreline</button>
     </div>
     <div id="tool-actions" class="coach-actions" hidden>
-      <button type="button" id="mode-draw" class="secondary">Redraw centreline</button>
-      <button type="button" id="mode-xs" class="ghost">Cross-section</button>
+      <button type="button" id="mode-draw" class="secondary" aria-pressed="false">Redraw centreline</button>
+      <button type="button" id="mode-xs" class="secondary" aria-pressed="false">Cross-section</button>
       <button type="button" id="clear-xs" class="ghost" disabled>Clear section</button>
     </div>
   </aside>
@@ -54,7 +54,7 @@
     </ul>
   </aside>
 
-  <form id="run-form" class="card params" hidden>
+  <form id="run-form" class="card params" hidden novalidate>
     <div class="params-head">
       <h2>Hydrology</h2>
       <p id="bridge-summary" class="muted">Name a bridge, then draw its river centreline.</p>
@@ -168,8 +168,9 @@
     <input id="along" name="along" type="hidden" value="300">
 
     <div class="run-actions">
-      <button type="submit" id="run-btn" class="primary" disabled>Run screening</button>
+      <button type="submit" id="run-btn" class="primary" aria-disabled="true">Run screening</button>
       <button type="button" id="stop-btn" class="stop" hidden>Stop screening</button>
+      <p id="run-status" class="status" role="status"></p>
     </div>
   </form>
 
@@ -227,6 +228,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=google-basemap"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=tool-clicks"></script>
 </body>
 </html>

@@ -402,10 +402,12 @@ button { font: inherit; cursor: pointer; }
 }
 
 .run-actions {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
   margin-top: 0.55rem;
+  z-index: 1;
 }
 
 .primary {
@@ -418,9 +420,16 @@ button { font: inherit; cursor: pointer; }
   padding: 0.72rem 0.8rem;
 }
 
-.primary:disabled {
+.primary:disabled,
+.primary[aria-disabled="true"] {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.secondary[aria-pressed="true"] {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
 }
 
 .stop {
@@ -585,9 +594,9 @@ th, td {
   .search { margin-left: 0; max-width: none; }
   .params {
     top: auto;
-    bottom: 0.7rem;
+    bottom: 3.4rem;
     max-height: 42vh;
   }
   .legend { display: none; }
-  .basemap-switch { bottom: 0.85rem; }
+  .basemap-switch { bottom: 0.85rem; z-index: 920; }
 }

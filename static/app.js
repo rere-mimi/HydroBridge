@@ -8,6 +8,7 @@ const searchForm = document.getElementById("search-form");
 const searchInput = document.getElementById("search-q");
 const searchResults = document.getElementById("search-results");
 const statusEl = document.getElementById("status");
+const runStatusEl = document.getElementById("run-status");
 const runForm = document.getElementById("run-form");
 const runBtn = document.getElementById("run-btn");
 const stopBtn = document.getElementById("stop-btn");
@@ -105,7 +106,12 @@ map.getPane("demPane").style.zIndex = 350;
 map.getPane("demPane").style.pointerEvents = "none";
 
 const overlay = L.layerGroup().addTo(map);
-const draftLine = L.polyline([], { color: "#0369a1", weight: 5, opacity: 0.95 }).addTo(map);
+const draftLine = L.polyline([], {
+  color: "#0369a1",
+  weight: 5,
+  opacity: 0.95,
+  interactive: false,
+}).addTo(map);
 const vertexLayer = L.layerGroup().addTo(map);
 const xsLayer = L.layerGroup().addTo(map);
 const xsDraftLine = L.polyline([], {
@@ -113,6 +119,7 @@ const xsDraftLine = L.polyline([], {
   weight: 3,
   dashArray: "6 6",
   opacity: 0.9,
+  interactive: false,
 }).addTo(map);
 
 const pinIcon = L.divIcon({
@@ -138,18 +145,44 @@ let xsRequestSeq = 0;
 let ranTransects = false;
 let runAbort = null;
 let runJobId = null;
+let runBusy = false;
+let runReady = false;
+let runBlockReason = "Double-click the map to pin a bridge, then draw the river.";
 
 function setStatus(message, kind) {
-  statusEl.textContent = message || "";
-  statusEl.className = "status" + (kind ? " " + kind : "");
+  const text = message || "";
+  const cls = "status" + (kind ? " " + kind : "");
+  statusEl.textContent = text;
+  statusEl.className = cls;
+  if (runStatusEl) {
+    runStatusEl.textContent = text;
+    runStatusEl.className = cls;
+  }
+}
+
+function setRunAvailability() {
+  runBtn.disabled = runBusy;
+  runBtn.setAttribute("aria-disabled", runBusy || !runReady ? "true" : "false");
+  runBtn.classList.toggle("is-disabled", runBusy || !runReady);
+  runBtn.textContent = runBusy ? "Running…" : "Run screening";
 }
 
 function setRunning(running) {
+  runBusy = running;
   stopBtn.hidden = !running;
   stopBtn.disabled = !running;
-  if (running) {
-    runBtn.disabled = true;
+  setRunAvailability();
+}
+
+function newJobId() {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+  } catch (_err) {
+    /* fall through */
   }
+  return `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function fmt(value, digits) {
@@ -237,18 +270,26 @@ function updateLayoutPreview() {
   analysisLengthEl.textContent = along >= 2 ? `${along.toFixed(0)} m` : "—";
   if (along < 2) {
     layoutPreview.textContent = "Draw the centreline to set the analysis length.";
-    runBtn.disabled = true;
+    runReady = false;
+    runBlockReason = "Draw the river centreline first. Its length is the analysis reach.";
+    setRunAvailability();
     return;
   }
   if (!(interval > 0) || !(length > 0) || !(spacing > 0)) {
     layoutPreview.textContent = "Enter transect length and spacing.";
-    runBtn.disabled = true;
+    runReady = false;
+    runBlockReason = "Enter transect length, spacing, and sample spacing before running.";
+    setRunAvailability();
     return;
   }
   const nTransects = Math.floor(along / interval + 1e-9) + 1;
   const nSamples = Math.min(2001, Math.floor(length / spacing) + 1);
   layoutPreview.textContent = `${nTransects} transects along the drawn ${along.toFixed(0)} m · ${nSamples} DEM points each`;
-  runBtn.disabled = !marker;
+  runReady = Boolean(marker);
+  runBlockReason = marker
+    ? ""
+    : "Double-click the map to pin a bridge first.";
+  setRunAvailability();
 }
 
 function setCoach(text) {
@@ -351,6 +392,7 @@ function redrawDraft() {
       fillColor: "#7dd3fc",
       fillOpacity: 1,
       weight: 2,
+      interactive: false,
     }).addTo(vertexLayer);
   });
   syncChrome();
@@ -387,6 +429,7 @@ function xsVertexStyle() {
     fillColor: "#ddd6fe",
     fillOpacity: 1,
     weight: 2,
+    interactive: false,
   };
 }
 
@@ -400,7 +443,12 @@ function drawXsLine() {
       .addTo(xsLayer);
   });
   if (xsPoints.length === 2) {
-    L.polyline(xsPoints, { color: "#7c3aed", weight: 4, opacity: 0.95 }).addTo(xsLayer);
+    L.polyline(xsPoints, {
+      color: "#7c3aed",
+      weight: 4,
+      opacity: 0.95,
+      interactive: false,
+    }).addTo(xsLayer);
   }
   refreshLegend();
 }
@@ -608,6 +656,7 @@ function handleXsClick(latlng) {
   drawXsLine();
   if (xsPoints.length === 1) {
     setCoach("Click the second point on the DEM.");
+    setStatus("First cross-section point placed. Click the second point.", "ok");
     showXsViewer();
     if (!xsProfile) {
       clearXsChart();
@@ -624,20 +673,23 @@ function setMode(next) {
   mode = next;
   document.body.classList.toggle("mode-draw", mode === "draw");
   document.body.classList.toggle("mode-xs", mode === "xs");
+  modeDrawBtn.setAttribute("aria-pressed", String(mode === "draw"));
+  modeXsBtn.setAttribute("aria-pressed", String(mode === "xs"));
   drawingStroke = false;
   if (mode === "draw") {
     map.dragging.disable();
     setCoach("Click or drag along the river through the bridge. Double-click the last point when the line is done.");
   } else if (mode === "xs") {
-    map.dragging.enable();
+    map.dragging.disable();
     setCoach(
       xsPoints.length === 1
         ? "Click the second point on the DEM."
-        : "Left-click two points on the DEM to draw a cross-section."
+        : "Cross-section tool is on. Left-click two points on the map to sample the DEM."
     );
+    setStatus("Cross-section tool is on. Click two points on the map.", "ok");
   } else if (mode === "params") {
     map.dragging.enable();
-    setCoach("Set transect length and spacing. The drawn centreline is the analysis length. Double-click the map to pin a different bridge.");
+    setCoach("Set transect length and spacing, then Run screening. Use Cross-section to sample the DEM, or double-click to pin a different bridge.");
   } else if (marker) {
     map.dragging.enable();
     setCoach("Draw the river centreline through the bridge, or double-click elsewhere to move the pin.");
@@ -697,7 +749,7 @@ function drawRunGeometry(payload) {
   overlay.clearLayers();
   (payload.transects || []).forEach((tran) => {
     const line = (tran.coords || []).map(([lon, lat]) => [lat, lon]);
-    L.polyline(line, { color: "#ea580c", weight: 2, opacity: 0.85 }).addTo(overlay);
+    L.polyline(line, { color: "#ea580c", weight: 2, opacity: 0.85, interactive: false }).addTo(overlay);
     (tran.samples || []).forEach(([lon, lat]) => {
       L.circleMarker([lat, lon], {
         radius: 3,
@@ -705,6 +757,7 @@ function drawRunGeometry(payload) {
         fillColor: "#fff",
         fillOpacity: 1,
         weight: 1.5,
+        interactive: false,
       }).addTo(overlay);
     });
   });
@@ -766,15 +819,19 @@ function hideSearchResults() {
   searchResults.innerHTML = "";
 }
 
-map.on("click", (event) => {
+function applyMapClick(latlng) {
   if (!nameModal.hidden) return;
   if (mode === "draw") {
-    addVertex(event.latlng);
+    addVertex(latlng);
     return;
   }
   if (mode === "xs") {
-    handleXsClick(event.latlng);
+    handleXsClick(latlng);
   }
+}
+
+map.on("click", (event) => {
+  applyMapClick(event.latlng);
 });
 
 map.on("dblclick", (event) => {
@@ -838,13 +895,19 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-modeDrawBtn.addEventListener("click", () => {
+modeDrawBtn.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
   ranTransects = false;
   overlay.clearLayers();
   setMode("draw");
 });
 
-modeXsBtn.addEventListener("click", () => setMode("xs"));
+modeXsBtn.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  setMode("xs");
+});
 
 undoBtn.addEventListener("click", () => {
   drawnLatLngs.pop();
@@ -943,6 +1006,7 @@ searchForm.addEventListener("submit", async (event) => {
 
 runForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  event.stopPropagation();
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon) || !marker) {
     setStatus("Double-click the map to pin a bridge first.", "error");
@@ -953,12 +1017,16 @@ runForm.addEventListener("submit", async (event) => {
     setStatus("Draw the river centreline. Its length is the analysis length.", "error");
     return;
   }
+  if (!runReady || runBusy) {
+    setStatus(runBlockReason || "Finish placing the bridge and river before running.", "error");
+    return;
+  }
   const body = new FormData(runForm);
   body.set("lat", String(lat));
   body.set("lon", String(lon));
   body.set("along", alongInput.value);
   body.set("centerline", JSON.stringify(drawn));
-  const jobId = (crypto.randomUUID && crypto.randomUUID()) || `job-${Date.now()}`;
+  const jobId = newJobId();
   body.set("job_id", jobId);
   runJobId = jobId;
   runAbort = new AbortController();
@@ -996,6 +1064,36 @@ runForm.addEventListener("submit", async (event) => {
     runJobId = null;
     updateLayoutPreview();
   }
+});
+
+runBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (runBusy) {
+    event.preventDefault();
+    setStatus("Screening is already running. Click Stop to cancel it.", "error");
+    return;
+  }
+  if (!runReady) {
+    event.preventDefault();
+    setStatus(runBlockReason || "Finish placing the bridge and river before running.", "error");
+  }
+});
+
+document.querySelector(".run-actions").addEventListener("click", (event) => {
+  if (event.target === runBtn) return;
+  if (runBusy || runReady) return;
+  setStatus(runBlockReason || "Finish placing the bridge and river before running.", "error");
+});
+
+["coach", "run-form", "legend", "xs-viewer", "name-modal"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  L.DomEvent.disableClickPropagation(el);
+  L.DomEvent.disableScrollPropagation(el);
+});
+document.querySelectorAll(".chrome, .basemap-switch, .brand, .search").forEach((el) => {
+  L.DomEvent.disableClickPropagation(el);
+  L.DomEvent.disableScrollPropagation(el);
 });
 
 stopBtn.addEventListener("click", async () => {
