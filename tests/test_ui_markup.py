@@ -64,12 +64,12 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('data-ari="1000"', html)
         self.assertNotIn("Bundled Wellington", html)
         self.assertNotIn("Upload a GeoTIFF", html)
-        self.assertIn("Return period", html)
-        self.assertIn("Water level (max depth)", html)
+        self.assertIn('id="results-blocks"', html)
         self.assertIn('id="results-ari-toggle"', html)
         self.assertIn("Collapse return periods", html)
         self.assertNotIn(">Samples<", html)
         self.assertNotIn("Hyd. radius", html)
+        self.assertNotIn('id="results-table"', html)
 
     def test_dem_preview_stream_reports_percent(self):
         with patch("hydroscreen.iter_extract_linz_dem_for_bridge", side_effect=_fake_iter_extract):
