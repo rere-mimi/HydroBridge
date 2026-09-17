@@ -729,6 +729,22 @@ button { font: inherit; cursor: pointer; }
 
 .table-wrap { overflow: auto; }
 
+#results-body tr {
+  cursor: pointer;
+}
+
+#results-body tr:hover {
+  background: #f8fafc;
+}
+
+#results-body tr.is-selected {
+  background: #e0f2fe;
+}
+
+.leaflet-interactive {
+  cursor: pointer;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

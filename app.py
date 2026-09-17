@@ -346,6 +346,7 @@ def run():
         "used_synthetic_centerline": result["used_synthetic_centerline"],
         "layout": result.get("layout"),
         "centerline": result["centerline"],
+        "centerline_profile": result.get("centerline_profile"),
         "transects": [
             {
                 **feat,
