@@ -13,7 +13,7 @@ const runForm = document.getElementById("run-form");
 const runBtn = document.getElementById("run-btn");
 const stopBtn = document.getElementById("stop-btn");
 const resultsEl = document.getElementById("results");
-const resultsBody = document.getElementById("results-body");
+const resultsBlocks = document.getElementById("results-blocks");
 const resultsNote = document.getElementById("results-note");
 const plotsEl = document.getElementById("plots");
 const summaryLink = document.getElementById("summary-link");
@@ -147,6 +147,10 @@ function hydStatusHtml(hyd) {
   else if (hyd && hyd.conveys) cls = "status-ok";
   else if (hyd) cls = "status-fail";
   return `<span class="hyd-status ${cls}">${text}</span>`;
+}
+
+function ariShortLabel(scenario) {
+  return (scenario && scenario.label ? scenario.label : "").replace(" ARI", "");
 }
 
 function refreshAriPlot() {
@@ -1613,16 +1617,111 @@ function drawRunGeometry(payload) {
   refreshLegend();
 }
 
+function bindTransectBlock(el, transectId) {
+  const head = el.querySelector(".transect-block-head");
+  const pick = () => selectSection({ type: "transect", id: transectId }, { scroll: false });
+  el.addEventListener("click", pick);
+  if (head) {
+    head.tabIndex = 0;
+    head.setAttribute("role", "button");
+    head.setAttribute("aria-label", `Inspect transect ${transectId}`);
+    head.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        pick();
+      }
+    });
+  }
+}
+
+function renderTransectBlock(row, scenarios, { selected = false, expanded = true } = {}) {
+  const block = document.createElement("article");
+  block.className = "transect-block";
+  block.dataset.transect = String(row.transect);
+  if (selected) block.classList.add("is-selected");
+
+  const chips = scenarios.map((scenario) => {
+    const hyd = hydFor(row, scenario.key);
+    return `<span class="ari-chip" style="--ari-color:${scenario.color}"><i class="ari-swatch" style="background:${scenario.color}"></i>${ariShortLabel(scenario)} · ${hydStatusHtml(hyd)}</span>`;
+  }).join("");
+
+  let body = "";
+  if (!scenarios.length) {
+    body = `<p class="transect-block-empty">Select at least one return period to compare water level and velocity.</p>`;
+  } else if (!expanded) {
+    body = `<div class="ari-chips">${chips}</div>`;
+  } else {
+    const heads = scenarios.map((scenario) => `
+      <th scope="col" class="ari-colhead" style="--ari-color:${scenario.color}">
+        <span class="ari-cell"><i class="ari-swatch" style="background:${scenario.color}"></i>${ariShortLabel(scenario)}</span>
+      </th>`).join("");
+    const flowCells = scenarios.map((scenario) =>
+      `<td class="ari-metric" style="--ari-color:${scenario.color}">${fmt(scenario.flow_m3_s, 1)}</td>`
+    ).join("");
+    const wlCells = scenarios.map((scenario) => {
+      const hyd = hydFor(row, scenario.key);
+      return `<td class="ari-metric wl-cell" style="--ari-color:${scenario.color}">${fmt(hyd.water_level_m, 2)} <span class="max-depth">(max ${fmt(hyd.max_depth_m, 2)})</span></td>`;
+    }).join("");
+    const velCells = scenarios.map((scenario) => {
+      const hyd = hydFor(row, scenario.key);
+      return `<td class="ari-metric" style="--ari-color:${scenario.color}">${fmt(hyd.velocity_m_s, 2)}</td>`;
+    }).join("");
+    const statusCells = scenarios.map((scenario) => {
+      const hyd = hydFor(row, scenario.key);
+      return `<td class="ari-metric" style="--ari-color:${scenario.color}">${hydStatusHtml(hyd)}</td>`;
+    }).join("");
+    body = `
+      <div class="transect-block-scroll">
+        <table class="transect-ari-table" style="--ari-count:${scenarios.length}">
+          <caption class="sr-only">Transect ${row.transect} return-period comparison</caption>
+          <thead>
+            <tr>
+              <th scope="col">Return period</th>
+              ${heads}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">Flow (m³/s)</th>
+              ${flowCells}
+            </tr>
+            <tr>
+              <th scope="row">Water level (max depth) (m)</th>
+              ${wlCells}
+            </tr>
+            <tr>
+              <th scope="row">Velocity (m/s)</th>
+              ${velCells}
+            </tr>
+            <tr>
+              <th scope="row">Status</th>
+              ${statusCells}
+            </tr>
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  block.innerHTML = `
+    <header class="transect-block-head">
+      <h3>Transect ${row.transect}</h3>
+      <p>Offset ${fmt(row.offset_m, 1)} m</p>
+    </header>
+    ${body}`;
+  bindTransectBlock(block, row.transect);
+  return block;
+}
+
 function renderResults(payload, { scroll = true } = {}) {
   resultsEl.hidden = false;
   adaptMapLayout();
-  resultsBody.innerHTML = "";
+  if (resultsBlocks) resultsBlocks.innerHTML = "";
   plotsEl.innerHTML = "";
   const lengthNote = payload.layout?.along_m != null
     ? `Transects cover the ${Number(payload.layout.along_m).toFixed(0)} m centreline you drew.`
     : "Transects follow the river centreline you drew.";
   const scenarios = visibleScenarios(payload);
-  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Each orange numbered dot on the long section is a transect station. Colours in the table match the return-period profiles. Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
+  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Each orange numbered dot on the long section is a transect station. Each block is one transect; return periods sit side by side in the plot colours so flow, water level, velocity, and status can be compared. Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects, sampled every ${payload.layout.sample_spacing_m} m.`;
     const flow = scenarios.length
@@ -1648,7 +1747,7 @@ function renderResults(payload, { scroll = true } = {}) {
 
   const selectedId = selectedSection && selectedSection.type === "transect" ? selectedSection.id : null;
   const showCenterline = selectedSection && selectedSection.type === "centerline";
-  const manyAris = scenarios.length >= 3;
+  const manyAris = scenarios.length >= 4;
   const showAriRows = !manyAris || resultsArisExpanded;
   if (resultsAriToggle) {
     resultsAriToggle.hidden = !manyAris;
@@ -1657,62 +1756,11 @@ function renderResults(payload, { scroll = true } = {}) {
   }
 
   (payload.summary || []).forEach((row) => {
-    const bindRow = (tr) => {
-      tr.tabIndex = 0;
-      tr.setAttribute("role", "button");
-      tr.addEventListener("click", () => selectSection({ type: "transect", id: row.transect }, { scroll: false }));
-      tr.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          selectSection({ type: "transect", id: row.transect }, { scroll: false });
-        }
-      });
-    };
-
-    if (!scenarios.length) {
-      const tr = document.createElement("tr");
-      tr.className = "result-ari-row";
-      tr.innerHTML = `
-        <td><span class="result-card-label">Transect</span>${row.transect}</td>
-        <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
-        <td colspan="5">Select at least one return period to compare water level and velocity.</td>`;
-      bindRow(tr);
-      resultsBody.appendChild(tr);
-    } else if (!showAriRows) {
-      const tr = document.createElement("tr");
-      tr.className = "result-chips-row";
-      if (selectedId === row.transect) tr.classList.add("is-selected");
-      const chips = scenarios.map((scenario) => {
-        const hyd = hydFor(row, scenario.key);
-        return `<span class="ari-chip" style="--ari-color:${scenario.color}"><i class="ari-swatch" style="background:${scenario.color}"></i>${scenario.label.replace(" ARI", "")} · ${hydStatusHtml(hyd)}</span>`;
-      }).join("");
-      tr.innerHTML = `
-        <td><span class="result-card-label">Transect</span>${row.transect}</td>
-        <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
-        <td colspan="5"><div class="ari-chips">${chips}</div></td>`;
-      bindRow(tr);
-      resultsBody.appendChild(tr);
-    } else {
-      scenarios.forEach((scenario, index) => {
-        const hyd = hydFor(row, scenario.key);
-        const tr = document.createElement("tr");
-        tr.className = "result-ari-row";
-        if (index === 0) tr.classList.add("is-first");
-        tr.style.setProperty("--ari-color", scenario.color || "#0284c7");
-        tr.dataset.ari = String(scenario.years);
-        tr.dataset.transect = String(row.transect);
-        if (selectedId === row.transect) tr.classList.add("is-selected");
-        tr.innerHTML = `
-          <td><span class="result-card-label">Transect</span>${row.transect}</td>
-          <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
-          <td><span class="result-card-label">Return period</span><span class="ari-cell"><i class="ari-swatch" style="background:${scenario.color}"></i>${scenario.label.replace(" ARI", "")}</span></td>
-          <td><span class="result-card-label">Flow</span>${fmt(scenario.flow_m3_s, 1)}</td>
-          <td class="wl-cell"><span class="result-card-label">Water level</span>${fmt(hyd.water_level_m, 2)} <span class="max-depth">(max ${fmt(hyd.max_depth_m, 2)})</span></td>
-          <td><span class="result-card-label">Velocity</span>${fmt(hyd.velocity_m_s, 2)}</td>
-          <td><span class="result-card-label">Status</span>${hydStatusHtml(hyd)}</td>`;
-        bindRow(tr);
-        resultsBody.appendChild(tr);
-      });
+    if (resultsBlocks) {
+      resultsBlocks.appendChild(renderTransectBlock(row, scenarios, {
+        selected: selectedId === row.transect,
+        expanded: showAriRows,
+      }));
     }
 
     if (showCenterline) return;
@@ -1720,7 +1768,7 @@ function renderResults(payload, { scroll = true } = {}) {
     const fig = document.createElement("figure");
     const hydNote = scenarios.map((scenario) => {
       const hyd = hydFor(row, scenario.key);
-      return `${scenario.label.replace(" ARI", "")} WL ${fmt(hyd.water_level_m, 2)} m`;
+      return `${ariShortLabel(scenario)} WL ${fmt(hyd.water_level_m, 2)} m`;
     }).join(" · ");
     fig.innerHTML = `
       <img src="${row.plot}" alt="Cross-section for transect ${row.transect}">
