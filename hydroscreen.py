@@ -22,6 +22,7 @@ import math
 import tempfile
 import shutil
 import logging
+import threading
 from pathlib import Path
 
 import requests
@@ -64,6 +65,39 @@ DEM_PREVIEW_MIN_RADIUS_M = 1500.0
 
 class HydroScreenError(Exception):
     """Raised when screening cannot run (missing DEM, invalid inputs, etc.)."""
+
+
+class HydroScreenCancelled(HydroScreenError):
+    """Raised when the user stops a screening run."""
+
+
+def check_cancelled(cancel_event):
+    """Raise HydroScreenCancelled if the caller asked to stop."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise HydroScreenCancelled("Screening stopped.")
+
+
+def _run_interruptibly(fn, cancel_event):
+    """Run a blocking call so Stop can return before a download finishes."""
+    if cancel_event is None:
+        return fn()
+    check_cancelled(cancel_event)
+    box = {}
+
+    def worker():
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+    while worker_thread.is_alive():
+        check_cancelled(cancel_event)
+        worker_thread.join(0.2)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 # Utilities
 
@@ -400,6 +434,35 @@ def bbox_from_transects(lon, lat, transects, pad_m=50.0):
     radius = max(maxx - px, px - minx, maxy - py, py - miny)
     return (min(lons), min(lats), max(lons), max(lats)), float(radius)
 
+
+def bbox_from_lonlat_points(points, pad_m=80.0):
+    """Geographic bbox covering lon/lat points, padded in metres."""
+    if not points:
+        raise HydroScreenError("Need coordinates to clip the DEM.")
+    transformer_to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    transformer_to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    xs = []
+    ys = []
+    for lon, lat in points:
+        x, y = transformer_to_3857.transform(float(lon), float(lat))
+        xs.append(x)
+        ys.append(y)
+    cx = 0.5 * (min(xs) + max(xs))
+    cy = 0.5 * (min(ys) + max(ys))
+    minx = max(min(xs) - pad_m, cx - MAX_DEM_RADIUS_M)
+    maxx = min(max(xs) + pad_m, cx + MAX_DEM_RADIUS_M)
+    miny = max(min(ys) - pad_m, cy - MAX_DEM_RADIUS_M)
+    maxy = min(max(ys) + pad_m, cy + MAX_DEM_RADIUS_M)
+    corners = [
+        transformer_to_4326.transform(minx, miny),
+        transformer_to_4326.transform(minx, maxy),
+        transformer_to_4326.transform(maxx, miny),
+        transformer_to_4326.transform(maxx, maxy),
+    ]
+    lons = [c[0] for c in corners]
+    lats = [c[1] for c in corners]
+    return (min(lons), min(lats), max(lons), max(lats))
+
 # OSM centreline via Overpass
 
 def query_osm_waterway(lat, lon, radius_m=200):
@@ -441,12 +504,14 @@ out geom;
 
 # Transect generation
 
-def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None, along_m=None):
+def generate_transects(centerline: LineString, distances_m=None, interval=50, n_each_side=3, length_m=200, bridge_lon=None, bridge_lat=None, along_m=None, cover_full_line=False):
     """Generate transects perpendicular to the centreline.
 
     Stations are measured from the nearest point on the centreline to the
     bridge coordinates when provided; otherwise the line midpoint is used.
-    If along_m is set, stations run from -along_m/2 to +along_m/2 at `interval`.
+    If cover_full_line is set, stations run from the start to the end of the
+    drawn centreline at `interval`. Otherwise, if along_m is set, stations run
+    from -along_m/2 to +along_m/2 at `interval`.
     Returns list of (transect LineString, station_m).
     """
     if interval <= 0:
@@ -468,12 +533,25 @@ def generate_transects(centerline: LineString, distances_m=None, interval=50, n_
     else:
         origin = total_len / 2.0
     if not distances_m:
-        if along_m is None:
-            along_m = 2.0 * n_each_side * interval
-        half = max(float(along_m), 0.0) / 2.0
-        n = int(math.floor(half / interval + 1e-9))
-        n = min(max(n, 0), 50)
-        distances_m = [i * interval for i in range(-n, n + 1)]
+        if cover_full_line:
+            n = int(math.floor(total_len / interval + 1e-9)) if interval > 0 else 0
+            n = min(max(n, 0), 100)
+            starts = [float(i * interval) for i in range(n + 1)]
+            if not starts:
+                starts = [0.0]
+            if total_len - starts[-1] > 0.5:
+                starts.append(float(total_len))
+            if all(abs(s - origin) > 0.25 for s in starts):
+                starts.append(float(min(max(origin, 0.0), total_len)))
+                starts.sort()
+            distances_m = [s - origin for s in starts]
+        else:
+            if along_m is None:
+                along_m = 2.0 * n_each_side * interval
+            half = max(float(along_m), 0.0) / 2.0
+            n = int(math.floor(half / interval + 1e-9))
+            n = min(max(n, 0), 50)
+            distances_m = [i * interval for i in range(-n, n + 1)]
     stations = [origin + d for d in distances_m]
 
     transects = []
@@ -552,6 +630,61 @@ def sample_dem_along_line(dem_path, line: LineString, n_points=None, spacing_m=N
                 elevations.append(float(v))
         return np.array(distances), np.array(elevations), coords
 
+
+MAX_XS_LENGTH_M = 2000.0
+
+
+def sample_drawn_cross_section(lon1, lat1, lon2, lat2, dem_path=None, spacing_m=1.0):
+    """Sample DEM elevations along a two-point line and return a JSON-ready profile."""
+    try:
+        lon1, lat1, lon2, lat2 = float(lon1), float(lat1), float(lon2), float(lat2)
+    except (TypeError, ValueError) as exc:
+        raise HydroScreenError("Cross-section points must be numbers.") from exc
+    if not (-180 <= lon1 <= 180 and -180 <= lon2 <= 180 and -90 <= lat1 <= 90 and -90 <= lat2 <= 90):
+        raise HydroScreenError("Cross-section coordinates are out of range.")
+    if spacing_m is None or float(spacing_m) <= 0:
+        raise HydroScreenError("Sample spacing on the transect must be greater than 0.")
+    spacing_m = float(spacing_m)
+    length = haversine(lon1, lat1, lon2, lat2)
+    if length < 1.0:
+        raise HydroScreenError("The cross-section line is too short. Click two points farther apart.")
+    if length > MAX_XS_LENGTH_M:
+        raise HydroScreenError(
+            f"The cross-section can be at most {int(MAX_XS_LENGTH_M)} m long. Draw a shorter line near the bridge."
+        )
+
+    line = LineString([(lon1, lat1), (lon2, lat2)])
+    temp_dir = None
+    source = "local"
+    try:
+        if dem_path is None:
+            bbox = bbox_from_lonlat_points([(lon1, lat1), (lon2, lat2)], pad_m=80.0)
+            temp_dir = tempfile.mkdtemp(prefix="hydroscreen_xs_")
+            dem_path = os.path.join(temp_dir, "dem.tif")
+            download_linz_lidar_1m(bbox, dem_path)
+            source = "linz-lidar-1m"
+        dists, elevs, _coords = sample_dem_along_line(dem_path, line, spacing_m=spacing_m)
+        finite = elevs[np.isfinite(elevs)]
+        if len(finite) == 0:
+            raise HydroScreenError(
+                "No DEM elevations along this line. Draw it over the LiDAR coverage around the bridge."
+            )
+        return {
+            "distance_m": [float(x) for x in dists],
+            "elevation_m": [None if not np.isfinite(z) else float(z) for z in elevs],
+            "length_m": float(dists[-1]) if len(dists) else float(length),
+            "n_samples": int(len(dists)),
+            "sample_spacing_m": spacing_m,
+            "zmin": float(np.min(finite)),
+            "zmax": float(np.max(finite)),
+            "source": source,
+            "start": [lon1, lat1],
+            "end": [lon2, lat2],
+        }
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 # simple haversine
 
 def haversine(lon1, lat1, lon2, lat2):
@@ -619,7 +752,7 @@ def manning_discharge(area, radius, mannings_n, slope):
     return float(velocity), float(velocity * area)
 
 
-def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
+def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, cancel_event=None):
     """Raise water level along the transect until Manning Q matches the specified flow."""
     finite = elevs[np.isfinite(elevs)]
     empty = {
@@ -652,6 +785,7 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
     velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
     # Increase stage until conveyance meets the target flow.
     while discharge < flow_m3_s and wse < max_wse:
+        check_cancelled(cancel_event)
         wse += step_m
         hyd = hydraulics_at_stage(dists, elevs, wse)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
@@ -660,6 +794,7 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02):
     lo = max(zmin, wse - step_m)
     hi = wse
     for _ in range(24):
+        check_cancelled(cancel_event)
         mid = 0.5 * (lo + hi)
         hyd = hydraulics_at_stage(dists, elevs, mid)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
@@ -767,6 +902,13 @@ def centerline_from_coords(coords):
     return line
 
 
+def projected_length_m(line: LineString) -> float:
+    """Length of a lon/lat line in metres (Web Mercator)."""
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    proj = LineString([transformer.transform(x, y) for x, y in line.coords])
+    return float(proj.length)
+
+
 def run_screening(
     lat,
     lon,
@@ -783,10 +925,12 @@ def run_screening(
     along_m=None,
     sample_spacing=1.0,
     centerline_coords=None,
+    cancel_event=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    check_cancelled(cancel_event)
 
     if along_m is None:
         along_m = 2.0 * n_each_side * interval
@@ -795,19 +939,26 @@ def run_screening(
     if flow_m3_s < 0:
         raise HydroScreenError("Flow rate cannot be negative.")
 
+    cover_full_line = False
     if centerline_coords:
         logging.info("Using user-drawn river centreline (%d vertices)", len(centerline_coords))
         centerline = centerline_from_coords(centerline_coords)
         centerline_source = "drawn"
+        cover_full_line = True
+        along_m = projected_length_m(centerline)
     else:
         logging.info("Querying OSM for waterway near lat=%s lon=%s", lat, lon)
-        centerline = query_osm_waterway(lat, lon, radius_m=500)
+        centerline = _run_interruptibly(
+            lambda: query_osm_waterway(lat, lon, radius_m=500),
+            cancel_event,
+        )
         if centerline is None:
             logging.warning("No OSM waterway found within 500 m. Using a synthetic centreline (line through point).")
             centerline = LineString([(lon - 0.005, lat), (lon + 0.005, lat)])
             centerline_source = "synthetic"
         else:
             centerline_source = "osm"
+    check_cancelled(cancel_event)
 
     transects = generate_transects(
         centerline,
@@ -817,10 +968,12 @@ def run_screening(
         bridge_lon=lon,
         bridge_lat=lat,
         along_m=along_m,
+        cover_full_line=cover_full_line,
     )
     if not transects:
         raise HydroScreenError("No transects could be generated along the river centreline.")
     logging.info("Generated %d transects", len(transects))
+    check_cancelled(cancel_event)
 
     dem_path = dem
     temp_dir = None
@@ -832,11 +985,15 @@ def run_screening(
         buffer_m = fallback_radius
 
     if dem_path is None:
+        check_cancelled(cancel_event)
         temp_dir = tempfile.mkdtemp(prefix="hydroscreen_")
         out_tif = os.path.join(temp_dir, "dem.tif")
         if wcs_base and wcs_layer:
             logging.info("Attempting user-supplied WCS for bbox (buffer %sm)", buffer_m)
-            ok = download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif)
+            ok = _run_interruptibly(
+                lambda: download_wcs_getcoverage(wcs_base, wcs_layer, bbox, out_tif),
+                cancel_event,
+            )
             if ok and _raster_covers_bbox(out_tif, bbox):
                 dem_path = out_tif
                 dem_source_used = "wcs"
@@ -851,7 +1008,10 @@ def run_screening(
             )
             linz_out = os.path.join(temp_dir, "linz_dem.tif")
             try:
-                dem_path = download_linz_lidar_1m(bbox, linz_out)
+                dem_path = _run_interruptibly(
+                    lambda: download_linz_lidar_1m(bbox, linz_out),
+                    cancel_event,
+                )
                 dem_source_used = "linz-lidar-1m"
             except HydroScreenError:
                 raise
@@ -872,7 +1032,11 @@ def run_screening(
             "The selected DEM does not cover this bridge location. Choose a point inside the DEM or upload a different file."
         )
 
-    reach = centerline_reach(centerline, lon, lat, along_m)
+    check_cancelled(cancel_event)
+    if cover_full_line:
+        reach = centerline
+    else:
+        reach = centerline_reach(centerline, lon, lat, along_m)
     slope = estimate_centerline_slope(dem_path, reach, spacing_m=max(sample_spacing, 5.0))
     if slope is None:
         raise HydroScreenError(
@@ -886,11 +1050,17 @@ def run_screening(
     transect_features = []
     point_id = 1
     for i, (tran, offset) in enumerate(transects):
+        check_cancelled(cancel_event)
         dists, elevs, sample_coords = sample_dem_along_line(
             dem_path, tran, spacing_m=sample_spacing
         )
         stats = solve_water_level(
-            dists, elevs, flow_m3_s=flow_m3_s, mannings_n=mannings_n, slope=slope
+            dists,
+            elevs,
+            flow_m3_s=flow_m3_s,
+            mannings_n=mannings_n,
+            slope=slope,
+            cancel_event=cancel_event,
         )
         df = pd.DataFrame({
             "distance_m": dists,
@@ -935,6 +1105,7 @@ def run_screening(
             "plot": png_path.name,
         })
 
+    check_cancelled(cancel_event)
     summary_path = outdir / "summary.xlsx"
     write_screening_workbook(summary_path, summary, data_rows)
     logging.info("Wrote summary workbook to %s (%d sample points)", summary_path, len(data_rows))
