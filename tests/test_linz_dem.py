@@ -100,6 +100,41 @@ class ClipDemTilesTests(unittest.TestCase):
                 self.assertGreater(arr.size, 0)
                 self.assertTrue(np.allclose(arr[arr != -9999], 12.5))
 
+    def test_reports_clip_progress(self):
+        transform = from_origin(1748000.0, 5429000.0, 1.0, 1.0)
+        data = np.full((80, 80), 12.5, dtype=np.float32)
+        seen = []
+
+        def on_progress(fraction, message=None):
+            seen.append((float(fraction), message))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / "tile.tif"
+            out_path = Path(tmp) / "clip.tif"
+            with rasterio.open(
+                src_path,
+                "w",
+                driver="GTiff",
+                height=80,
+                width=80,
+                count=1,
+                dtype="float32",
+                crs="EPSG:2193",
+                transform=transform,
+                nodata=-9999.0,
+            ) as dst:
+                dst.write(data, 1)
+            clip_dem_tiles(
+                [str(src_path)],
+                (1748020.0, 5428940.0, 1748060.0, 5428980.0),
+                str(out_path),
+                progress=on_progress,
+            )
+        self.assertGreaterEqual(len(seen), 3)
+        self.assertEqual(seen[-1][0], 1.0)
+        percents = [item[0] for item in seen]
+        self.assertEqual(percents, sorted(percents))
+
     def test_raises_when_window_is_all_nodata(self):
         transform = from_origin(1748000.0, 5429000.0, 1.0, 1.0)
         data = np.full((40, 40), -9999.0, dtype=np.float32)

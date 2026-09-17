@@ -326,7 +326,13 @@ def linz_tiles_for_bbox(bbox, tiles=None):
     return sorted(hits)
 
 
-def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=None):
+def _emit_progress(progress, fraction, message=None):
+    if progress is None:
+        return
+    progress(max(0.0, min(1.0, float(fraction))), message)
+
+
+def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=None, progress=None):
     """Mosaic windowed reads from GeoTIFF URIs into an NZTM clip."""
     _configure_gdal_http()
     west, south, east, north = bounds_2193
@@ -334,23 +340,46 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
         raise HydroScreenError("Invalid DEM clip window.")
     datasets = []
     try:
+        _emit_progress(progress, 0.04, "Opening DEM tiles")
         for uri in tile_uris:
             datasets.append(rasterio.open(uri))
         if not datasets:
             raise HydroScreenError("No DEM tiles were available to clip.")
-        merge_kw = {
-            "bounds": (west, south, east, north),
-            "nodata": nodata,
-        }
-        if resolution is not None:
-            merge_kw["res"] = (float(resolution), float(resolution))
-        mosaic, transform = raster_merge(datasets, **merge_kw)
-        data = mosaic[0]
+        _emit_progress(progress, 0.1, "Downloading DEM")
+        res = float(resolution) if resolution is not None else float(datasets[0].res[0])
+        height = max(1, int(round((north - south) / res)))
+        n_strips = 1 if progress is None else min(10, height)
+        merge_kw = {"nodata": nodata, "res": (res, res)}
+        strips = []
+        transform = None
+        for i in range(n_strips):
+            strip_north = north - (i / n_strips) * (north - south)
+            strip_south = north - ((i + 1) / n_strips) * (north - south)
+            if strip_north <= strip_south:
+                continue
+            mosaic, transform_i = raster_merge(
+                datasets,
+                bounds=(west, strip_south, east, strip_north),
+                **merge_kw,
+            )
+            strips.append(mosaic[0])
+            if transform is None:
+                transform = transform_i
+            _emit_progress(
+                progress,
+                0.1 + 0.8 * ((i + 1) / n_strips),
+                "Downloading DEM",
+            )
+        if not strips:
+            raise HydroScreenError("Invalid DEM clip window.")
+        width = min(s.shape[1] for s in strips)
+        data = np.vstack([s[:, :width] for s in strips])
         valid = np.isfinite(data) & (data != nodata)
         if not np.any(valid):
             raise HydroScreenError(
                 "The New Zealand LiDAR 1m DEM has no elevation values at this site."
             )
+        _emit_progress(progress, 0.94, "Writing DEM clip")
         profile = {
             "driver": "GTiff",
             "height": int(data.shape[0]),
@@ -366,13 +395,14 @@ def clip_dem_tiles(tile_uris, bounds_2193, out_tif, nodata=-9999.0, resolution=N
         }
         with rasterio.open(out_tif, "w", **profile) as dst:
             dst.write(data, 1)
+        _emit_progress(progress, 1.0, "DEM ready")
     finally:
         for src in datasets:
             src.close()
     return out_tif
 
 
-def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None):
+def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None, progress=None):
     """Clip LINZ layer 121859 (national LiDAR 1 m DEM) around bbox and write out_tif.
 
     When bounds_2193 is set, the GeoTIFF is clipped to that exact NZTM window
@@ -385,11 +415,14 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None):
     with _CACHE_LOCK:
         if cache_file.exists() and cache_file.stat().st_size > 256:
             logging.info("Reusing cached New Zealand LiDAR clip %s", cache_file.name)
+            _emit_progress(progress, 0.7, "Reusing cached DEM")
             if out_path.resolve() != cache_file.resolve():
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(cache_file, out_path)
+            _emit_progress(progress, 1.0, "DEM ready")
             return str(out_path)
 
+    _emit_progress(progress, 0.04, "Finding DEM tiles")
     codes = linz_tiles_for_bbox(bbox)
     if not codes:
         raise HydroScreenError(
@@ -410,7 +443,13 @@ def download_linz_lidar_1m(bbox, out_tif, resolution=None, bounds_2193=None):
         "Clipping New Zealand LiDAR 1m DEM (LINZ 121859) from sheets %s",
         ", ".join(codes),
     )
-    clip_dem_tiles(uris, (west, south, east, north), out_tif, resolution=resolution)
+    clip_dem_tiles(
+        uris,
+        (west, south, east, north),
+        out_tif,
+        resolution=resolution,
+        progress=progress,
+    )
     with _CACHE_LOCK:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -488,7 +527,15 @@ def render_dem_overlay_png(dem_path, bbox_4326, max_px=DEM_PREVIEW_MAX_PX):
     return buf.getvalue(), (west, south, east, north)
 
 
-def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, buffer=200.0):
+def preview_dem_overlay(
+    lat,
+    lon,
+    dem_path=None,
+    along_m=300.0,
+    length=200.0,
+    buffer=200.0,
+    progress=None,
+):
     """Build a map overlay PNG of the DEM HydroBridge will sample at this site."""
     bounds_2193 = square_clip_2193(lat, lon)
     bbox = bbox_4326_from_2193(bounds_2193)
@@ -498,11 +545,22 @@ def preview_dem_overlay(lat, lon, dem_path=None, along_m=300.0, length=200.0, bu
     source = "local"
     try:
         if src_path is None:
+            _emit_progress(progress, 0.02, "Downloading DEM")
             temp_dir = tempfile.mkdtemp(prefix="hydroscreen_preview_")
             src_path = os.path.join(temp_dir, "dem.tif")
-            download_linz_lidar_1m(bbox, src_path, bounds_2193=bounds_2193)
+
+            def download_progress(fraction, message=None):
+                _emit_progress(progress, 0.05 + 0.8 * float(fraction), message or "Downloading DEM")
+
+            download_linz_lidar_1m(
+                bbox, src_path, bounds_2193=bounds_2193, progress=download_progress
+            )
             source = "linz-lidar-1m"
+        else:
+            _emit_progress(progress, 0.45, "Reading DEM")
+        _emit_progress(progress, 0.9, "Drawing DEM overlay")
         png, bounds = render_dem_overlay_png(src_path, bbox)
+        _emit_progress(progress, 1.0, "DEM ready")
         return {
             "png": png,
             "bounds": bounds,

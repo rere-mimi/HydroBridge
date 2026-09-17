@@ -1,5 +1,6 @@
 """The map UI must expose working Run and Cross-section controls."""
 
+import json
 import unittest
 
 from app import app
@@ -18,9 +19,37 @@ class UiMarkupTests(unittest.TestCase):
         self.assertIn('id="run-status"', html)
         self.assertIn("novalidate", html)
         self.assertIn('id="busy"', html)
+        self.assertIn('id="busy-bar"', html)
+        self.assertIn('id="busy-pct"', html)
+        self.assertIn('id="dem-opacity"', html)
         self.assertIn("500 m", html)
         self.assertIn("busy-spinner", html)
         self.assertNotIn("disabled>Run screening", html)
+
+    def test_dem_preview_stream_reports_percent(self):
+        response = self.client.post(
+            "/api/dem-preview?stream=1",
+            data={
+                "lat": -41.2865,
+                "lon": 174.7762,
+                "dem_source": "sample",
+                "stream": "1",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True)[:500])
+        events = [
+            json.loads(line)
+            for line in response.get_data(as_text=True).splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(events)
+        percents = [item["percent"] for item in events if "percent" in item]
+        self.assertTrue(percents)
+        self.assertEqual(percents[0], 0)
+        self.assertEqual(percents[-1], 100)
+        done = events[-1]
+        self.assertTrue(done.get("png"))
+        self.assertTrue(done.get("bounds"))
 
     def test_cross_section_api_still_accepts_two_points(self):
         response = self.client.post(

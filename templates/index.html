@@ -27,8 +27,16 @@
   </header>
 
   <div id="busy" class="busy" hidden role="status" aria-live="polite">
-    <span class="spinner" aria-hidden="true"></span>
-    <span id="busy-text">Working…</span>
+    <span class="spinner" id="busy-spinner" aria-hidden="true"></span>
+    <div class="busy-copy">
+      <div class="busy-row">
+        <span id="busy-text">Working…</span>
+        <span id="busy-pct" hidden>0%</span>
+      </div>
+      <div id="busy-bar" class="progress" hidden>
+        <div id="busy-bar-fill" class="progress-fill"></div>
+      </div>
+    </div>
   </div>
 
   <aside id="coach" class="card coach" aria-live="polite">
@@ -57,6 +65,13 @@
     <ul id="legend-list">
       <li data-key="basemap"><span class="swatch basemap map"></span> Google Map</li>
     </ul>
+    <label id="dem-opacity-control" class="dem-opacity" hidden>
+      <span class="dem-opacity-label">
+        DEM transparency
+        <span id="dem-opacity-value">50%</span>
+      </span>
+      <input id="dem-opacity" type="range" min="0" max="100" value="50" step="1">
+    </label>
   </aside>
 
   <form id="run-form" class="card params" hidden novalidate>
@@ -233,6 +248,6 @@
   </section>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=busy-spinner"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=dem-progress"></script>
 </body>
 </html>

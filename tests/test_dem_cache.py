@@ -36,7 +36,7 @@ class LinzClipCacheTests(unittest.TestCase):
             out2 = Path(tmp) / "b.tif"
             calls = []
 
-            def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None):
+            def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
                 calls.append(out_tif)
                 Path(out_tif).write_bytes(b"CLIPPED-DEM" * 40)
                 return out_tif
@@ -59,7 +59,7 @@ class LinzClipCacheTests(unittest.TestCase):
             out2 = Path(tmp) / "b.tif"
             calls = []
 
-            def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None):
+            def fake_clip(uris, bounds, out_tif, nodata=-9999.0, resolution=None, progress=None):
                 calls.append(bounds)
                 Path(out_tif).write_bytes(b"SQUARE-CLIP" * 40)
                 return out_tif

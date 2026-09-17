@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
 import secrets
 import tempfile
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from flask import Flask, abort, jsonify, render_template, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory, stream_with_context
 
 from hydroscreen import (
     HydroScreenCancelled,
@@ -119,6 +120,17 @@ def reverse_geocode():
         return jsonify({"label": None})
 
 
+def _preview_payload(result):
+    west, south, east, north = result["bounds"]
+    return {
+        "png": b64encode(result["png"]).decode("ascii"),
+        "bounds": [[south, west], [north, east]],
+        "source": result["source"],
+        "radius_m": result["radius_m"],
+        "clip_size_m": result.get("clip_size_m"),
+    }
+
+
 @app.route("/api/dem-preview", methods=["GET", "POST"])
 def dem_preview():
     src = request.form if request.method == "POST" else request.args
@@ -156,6 +168,60 @@ def dem_preview():
     elif dem_source != "linz":
         return jsonify({"error": "Choose the New Zealand LiDAR DEM, the sample DEM, or upload a GeoTIFF."}), 400
 
+    stream = (src.get("stream") or request.args.get("stream") or "").strip() == "1"
+    if stream:
+        events = queue.Queue()
+
+        def on_progress(fraction, message=None):
+            events.put({
+                "percent": int(round(max(0.0, min(1.0, float(fraction))) * 100)),
+                "message": message or "Downloading DEM…",
+            })
+
+        def work():
+            try:
+                result = preview_dem_overlay(
+                    lat,
+                    lon,
+                    dem_path=dem_path,
+                    along_m=along_m,
+                    length=length,
+                    progress=on_progress,
+                )
+                payload = _preview_payload(result)
+                payload["percent"] = 100
+                payload["message"] = "DEM ready"
+                payload["done"] = True
+                events.put(payload)
+            except HydroScreenError as exc:
+                events.put({"error": str(exc), "percent": 0, "done": True})
+            except Exception as exc:
+                logging.exception("DEM preview failed")
+                events.put({
+                    "error": f"Could not overlay the DEM: {exc}",
+                    "percent": 0,
+                    "done": True,
+                })
+            finally:
+                if dem_source == "upload" and dem_path:
+                    Path(dem_path).unlink(missing_ok=True)
+                events.put(None)
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def generate():
+            yield json.dumps({"percent": 0, "message": "Downloading DEM…"}) + "\n"
+            while True:
+                item = events.get()
+                if item is None:
+                    break
+                yield json.dumps(item) + "\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="application/x-ndjson",
+        )
+
     try:
         result = preview_dem_overlay(
             lat, lon, dem_path=dem_path, along_m=along_m, length=length
@@ -169,15 +235,9 @@ def dem_preview():
         if dem_source == "upload" and dem_path:
             Path(dem_path).unlink(missing_ok=True)
 
-    west, south, east, north = result["bounds"]
-    return jsonify({
-        "png": b64encode(result["png"]).decode("ascii"),
-        "bounds": [[south, west], [north, east]],
-        "source": result["source"],
-        "radius_m": result["radius_m"],
-        "clip_size_m": result.get("clip_size_m"),
-        "opacity": 0.5,
-    })
+    payload = _preview_payload(result)
+    payload["opacity"] = 0.5
+    return jsonify(payload)
 
 
 @app.post("/api/cross-section")
