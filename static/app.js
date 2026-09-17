@@ -470,7 +470,7 @@ function localAoiGeometry(pin) {
   };
 }
 
-function redrawAoi(serverAoi) {
+function redrawAoi(serverAoi, { fit = false } = {}) {
   aoiLayer.clearLayers();
   if (!marker) return;
   const pin = marker.getLatLng();
@@ -489,9 +489,10 @@ function redrawAoi(serverAoi) {
   }
   L.polygon(ring, {
     color: "#d97706",
-    weight: 2,
+    weight: 3,
+    dashArray: "7 4",
     fillColor: "#f59e0b",
-    fillOpacity: 0.08,
+    fillOpacity: 0.16,
     interactive: false,
   }).addTo(aoiLayer);
   const labels = { upstream: "U", downstream: "D", left: "L", right: "R" };
@@ -509,6 +510,13 @@ function redrawAoi(serverAoi) {
       }),
     }).addTo(aoiLayer);
   });
+  if (fit && ring && ring.length >= 4) {
+    map.fitBounds(L.latLngBounds(ring).pad(0.45), {
+      maxZoom: 17,
+      padding: [40, 40],
+      animate: false,
+    });
+  }
 }
 
 function appendAoiFields(body) {
@@ -768,11 +776,13 @@ async function refreshDemOverlay() {
       className: "dem-overlay",
     }).addTo(map);
     aoiFromServer = data.aoi || null;
-    redrawAoi(aoiFromServer);
+    redrawAoi(aoiFromServer, { fit: true });
     lastPreviewKey = key;
     refreshLegend();
     adaptMapLayout();
-    map.fitBounds(data.bounds, { padding: [28, 28], maxZoom: 17, animate: false });
+    if (!data.aoi) {
+      map.fitBounds(data.bounds, { padding: [28, 28], maxZoom: 17, animate: false });
+    }
   } catch (err) {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
@@ -828,6 +838,7 @@ function finishCentreline() {
   selectedSection = null;
   overlay.clearLayers();
   setMode("params");
+  redrawAoi(aoiFromServer, { fit: true });
   scheduleDemPreview();
 }
 
@@ -1411,6 +1422,7 @@ function placeBridge(lat, lon, name) {
   lastRun = null;
   selectedSection = null;
   setMode("draw");
+  redrawAoi(null, { fit: true });
   scheduleDemPreview();
 }
 
@@ -1792,7 +1804,7 @@ runForm.addEventListener("input", (event) => {
   }
   if (event.target && (event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral")) {
     aoiFromServer = null;
-    redrawAoi(null);
+    redrawAoi(null, { fit: true });
     scheduleDemPreview();
     refreshLegend();
   }
