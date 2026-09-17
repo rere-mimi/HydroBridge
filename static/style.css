@@ -515,6 +515,54 @@ fieldset.field {
 
 .unit-field span { color: var(--muted); font-size: 0.8rem; }
 
+.ari-field .muted { margin: 0.35rem 0 0; }
+
+.ari-list {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.45rem;
+}
+
+.ari-row {
+  display: grid;
+  grid-template-columns: 1.1rem 6.1rem 1fr;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.82rem;
+}
+
+.ari-row .unit-field {
+  margin-top: 0;
+  grid-template-columns: 1fr 2.6rem;
+}
+
+.ari-row input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent);
+}
+
+.ari-row input[disabled] {
+  background: #f1f5f9;
+  color: var(--muted);
+}
+
+.ari-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.ari-swatch {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.12);
+}
+
 input[type="number"],
 input[type="text"],
 input[type="file"] {
@@ -672,8 +720,8 @@ button { font: inherit; cursor: pointer; }
 .xs-viewer {
   position: relative;
   z-index: 850;
-  flex: 0 0 15.5rem;
-  height: 15.5rem;
+  flex: 0 0 18.5rem;
+  height: 18.5rem;
   display: flex;
   flex-direction: column;
   margin: 0 0.75rem 0.75rem;
@@ -697,7 +745,7 @@ button { font: inherit; cursor: pointer; }
 
 #xs-canvas {
   width: 100%;
-  height: 12rem;
+  height: 15rem;
   display: block;
   background: #f8fafc;
   border: 1px solid var(--line);
@@ -825,7 +873,7 @@ th, td {
     flex: 1 1 auto;
   }
   .xs-viewer {
-    flex-basis: 12.5rem;
-    height: 12.5rem;
+    flex-basis: 15rem;
+    height: 15rem;
   }
 }

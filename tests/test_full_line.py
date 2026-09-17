@@ -99,6 +99,10 @@ class CoverFullLineTests(unittest.TestCase):
         self.assertIn("station_m", first)
         self.assertGreaterEqual(first["station_m"], 0.0)
         self.assertLessEqual(first["station_m"], profile["length_m"] + 1.0)
+        self.assertIn("slope", profile)
+        self.assertGreater(profile["slope"], 0)
+        self.assertIn("aris", first)
+        self.assertIn("100y", first["aris"])
 
 
 if __name__ == "__main__":

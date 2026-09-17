@@ -18,6 +18,7 @@ from hydroscreen import (
     HydroScreenCancelled,
     HydroScreenError,
     iter_dem_preview,
+    normalize_flow_scenarios,
     preview_dem_overlay,
     run_screening,
     sample_drawn_cross_section,
@@ -273,6 +274,19 @@ def run():
     if mannings_n <= 0 or flow_m3_s < 0:
         return jsonify({"error": "Flow rate must be ≥ 0 and Manning's n must be greater than 0."}), 400
 
+    parsed_aris = None
+    raw_aris = (request.form.get("aris") or "").strip()
+    if raw_aris:
+        try:
+            parsed_aris = json.loads(raw_aris)
+        except json.JSONDecodeError:
+            return jsonify({"error": "Return periods could not be read. Select them again."}), 400
+    try:
+        flow_scenarios = normalize_flow_scenarios(flow_m3_s, parsed_aris)
+    except HydroScreenError as exc:
+        return jsonify({"error": str(exc)}), 400
+    flow_m3_s = flow_scenarios[0]["flow_m3_s"]
+
     centerline_coords = None
     raw_centerline = (request.form.get("centerline") or "").strip()
     if raw_centerline:
@@ -301,6 +315,7 @@ def run():
             sample_spacing=sample_spacing,
             mannings_n=mannings_n,
             flow_m3_s=flow_m3_s,
+            flow_scenarios=flow_scenarios,
             centerline_coords=centerline_coords,
             cancel_event=cancel_event,
         )
@@ -334,6 +349,7 @@ def run():
             "conveys": row.get("conveys"),
             "overtopped": row.get("overtopped"),
             "n_samples": row.get("n_samples"),
+            "aris": row.get("aris") or {},
             "plot": f"/results/{run_id}/{Path(row['plot']).name}",
             "csv": f"/results/{run_id}/{Path(row['csv']).name}",
         })
