@@ -191,5 +191,36 @@ class AriApiTests(unittest.TestCase):
         self.assertEqual(payload["centerline_profile"]["slope"], 0.002)
 
 
+class AriSummaryMarkupTests(unittest.TestCase):
+    def test_index_summary_table_is_return_period_first(self):
+        client = app.test_client()
+        html = client.get("/").get_data(as_text=True)
+        self.assertIn("Return period", html)
+        self.assertIn("Water level (max depth)", html)
+        self.assertIn("Flow (m³/s)", html)
+        self.assertNotIn("<th>Samples</th>", html)
+        self.assertNotIn("<th>Width (m)</th>", html)
+        self.assertNotIn("<th>Area (m²)</th>", html)
+        self.assertNotIn("<th>Hyd. radius (m)</th>", html)
+        self.assertIn("<th>Transect</th>", html)
+        self.assertIn("<th>Offset (m)</th>", html)
+        self.assertIn("<th>Status</th>", html)
+
+    def test_client_groups_summary_rows_by_return_period_colour(self):
+        root = Path(__file__).resolve().parents[1]
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn("function hydStatus", js)
+        self.assertIn("result-ari-row", js)
+        self.assertIn("resultsArisExpanded", js)
+        self.assertIn("Orange numbered dots = transect stations", js)
+        self.assertIn("orange numbered dots mark transect stations", js)
+        self.assertIn("--ari-color", js)
+        self.assertIn(".results-scroll", css)
+        self.assertIn("result-card-label", css)
+        self.assertIn("@media (max-width: 720px)", css)
+        self.assertIn("inset 5px 0 0 var(--ari-color", css)
+
+
 if __name__ == "__main__":
     unittest.main()

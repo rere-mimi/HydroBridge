@@ -17,6 +17,7 @@ const resultsBody = document.getElementById("results-body");
 const resultsNote = document.getElementById("results-note");
 const plotsEl = document.getElementById("plots");
 const summaryLink = document.getElementById("summary-link");
+const resultsAriToggle = document.getElementById("results-ari-toggle");
 const demTilesEl = document.getElementById("dem-tiles");
 const modeDrawBtn = document.getElementById("mode-draw");
 const modeXsBtn = document.getElementById("mode-xs");
@@ -130,6 +131,22 @@ function formatSlope(absSlope) {
 function hydFor(record, key) {
   if (record && record.aris && key && record.aris[key]) return record.aris[key];
   return record || {};
+}
+
+function hydStatus(hyd) {
+  if (!hyd) return "—";
+  if (hyd.overtopped) return "Overtops banks";
+  if (hyd.conveys) return "OK";
+  return "Cannot convey";
+}
+
+function hydStatusHtml(hyd) {
+  const text = hydStatus(hyd);
+  let cls = "status-unknown";
+  if (hyd && hyd.overtopped) cls = "status-overtop";
+  else if (hyd && hyd.conveys) cls = "status-ok";
+  else if (hyd) cls = "status-fail";
+  return `<span class="hyd-status ${cls}">${text}</span>`;
 }
 
 function refreshAriPlot() {
@@ -258,6 +275,7 @@ let demProgressOn = false;
 let demTransparency = 50;
 var lastRun = null;
 var selectedSection = null;
+var resultsArisExpanded = true;
 try {
   const savedTransparency = localStorage.getItem("hydroscreen-dem-transparency");
   if (savedTransparency != null && savedTransparency !== "") {
@@ -967,7 +985,7 @@ function drawXsProfile(profile, options = {}) {
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, cssW, cssH);
 
-  const legendCount = 1 + (slope ? 1 : 0) + Math.max(waterLevels.length, series.length);
+  const legendCount = 1 + (slope ? 1 : 0) + Math.max(waterLevels.length, series.length) + ((options.stations || []).length ? 1 : 0);
   const pad = {
     left: 52,
     right: hasVelocity ? 54 : 18,
@@ -1194,20 +1212,33 @@ function drawXsProfile(profile, options = {}) {
     bits.push("V dotted");
     legend.push({ color: item.color || "#0284c7", text: bits.join(" · "), dash: [] });
   });
+  if ((options.stations || []).length) {
+    legend.push({ color: "#ea580c", text: "Orange numbered dots = transect stations", dot: true });
+  }
 
   legend.forEach((item, index) => {
     const col = index > 2 ? 1 : 0;
     const row = col ? index - 3 : index;
     const x = pad.left + col * Math.max(220, plotW / 2);
     const y = 10 + row * 12;
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-    ctx.lineTo(x + 16, y);
-    ctx.strokeStyle = item.color;
-    ctx.setLineDash(item.dash || []);
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.setLineDash([]);
+    if (item.dot) {
+      ctx.beginPath();
+      ctx.arc(x + 8, y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = item.color;
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1.2;
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + 16, y);
+      ctx.strokeStyle = item.color;
+      ctx.setLineDash(item.dash || []);
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.fillStyle = "#334155";
     ctx.font = "10px Segoe UI, system-ui, sans-serif";
     ctx.fillText(item.text, x + 20, y + 3);
@@ -1520,7 +1551,7 @@ function showSelectedProfile() {
       ? scenarios.map((item) => item.label).join(", ")
       : "bed only";
     setXsMeta(
-      `${stations.length} transect stations along the ${fmt(profile.length_m || profile.distance_m[profile.distance_m.length - 1], 0)} m river line · slope S = ${formatSlope(slopeAbs)} · ${ariNote}`
+      `${stations.length} orange numbered dots mark transect stations along the ${fmt(profile.length_m || profile.distance_m[profile.distance_m.length - 1], 0)} m river line · slope S = ${formatSlope(slopeAbs)} · ${ariNote}`
     );
     showXsViewer();
     requestAnimationFrame(() => drawXsProfile(xsProfile, xsProfile.options));
@@ -1590,10 +1621,10 @@ function renderResults(payload, { scroll = true } = {}) {
   const lengthNote = payload.layout?.along_m != null
     ? `Transects cover the ${Number(payload.layout.along_m).toFixed(0)} m centreline you drew.`
     : "Transects follow the river centreline you drew.";
-  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
+  const scenarios = visibleScenarios(payload);
+  resultsNote.textContent = `${bridgeName ? bridgeName + " · " : ""}${lengthNote} Each orange numbered dot on the long section is a transect station. Colours in the table match the return-period profiles. Click a transect on the map to inspect that section, or the blue centreline to see stations along the river.`;
   if (payload.layout) {
     const extra = `${payload.layout.n_transects} transects, sampled every ${payload.layout.sample_spacing_m} m.`;
-    const scenarios = visibleScenarios(payload);
     const flow = scenarios.length
       ? ` ${scenarios.map((item) => `${item.label} Q=${Number(item.flow_m3_s).toFixed(1)} m³/s`).join("; ")}, n=${payload.layout.mannings_n}, centreline slope S=${formatSlope(payload.layout.slope)}.`
       : payload.layout.flow_m3_s != null
@@ -1617,37 +1648,84 @@ function renderResults(payload, { scroll = true } = {}) {
 
   const selectedId = selectedSection && selectedSection.type === "transect" ? selectedSection.id : null;
   const showCenterline = selectedSection && selectedSection.type === "centerline";
-  const tableScenario = visibleScenarios(payload)[0];
-  const tableKey = tableScenario && tableScenario.key;
+  const manyAris = scenarios.length >= 3;
+  const showAriRows = !manyAris || resultsArisExpanded;
+  if (resultsAriToggle) {
+    resultsAriToggle.hidden = !manyAris;
+    resultsAriToggle.textContent = resultsArisExpanded ? "Collapse return periods" : "Expand return periods";
+    resultsAriToggle.setAttribute("aria-expanded", showAriRows ? "true" : "false");
+  }
+
   (payload.summary || []).forEach((row) => {
-    const hyd = hydFor(row, tableKey);
-    const status = hyd.overtopped ? "Overtops banks" : (hyd.conveys ? "OK" : "Cannot convey");
-    const tr = document.createElement("tr");
-    if (selectedId === row.transect) tr.classList.add("is-selected");
-    tr.tabIndex = 0;
-    tr.setAttribute("role", "button");
-    tr.innerHTML = `
-      <td>${row.transect}</td>
-      <td>${fmt(row.offset_m, 1)}</td>
-      <td>${row.n_samples ?? "—"}</td>
-      <td>${fmt(hyd.water_level_m, 2)}</td>
-      <td>${fmt(hyd.max_depth_m, 2)}</td>
-      <td>${fmt(hyd.width_m, 1)}</td>
-      <td>${fmt(hyd.area_m2, 1)}</td>
-      <td>${fmt(hyd.hydraulic_radius_m, 2)}</td>
-      <td>${fmt(hyd.velocity_m_s, 2)}</td>
-      <td>${fmt(hyd.discharge_m3_s, 2)}</td>
-      <td>${status}</td>`;
-    tr.addEventListener("click", () => selectSection({ type: "transect", id: row.transect }, { scroll: false }));
-    resultsBody.appendChild(tr);
+    const bindRow = (tr) => {
+      tr.tabIndex = 0;
+      tr.setAttribute("role", "button");
+      tr.addEventListener("click", () => selectSection({ type: "transect", id: row.transect }, { scroll: false }));
+      tr.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectSection({ type: "transect", id: row.transect }, { scroll: false });
+        }
+      });
+    };
+
+    if (!scenarios.length) {
+      const tr = document.createElement("tr");
+      tr.className = "result-ari-row";
+      tr.innerHTML = `
+        <td><span class="result-card-label">Transect</span>${row.transect}</td>
+        <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
+        <td colspan="5">Select at least one return period to compare water level and velocity.</td>`;
+      bindRow(tr);
+      resultsBody.appendChild(tr);
+    } else if (!showAriRows) {
+      const tr = document.createElement("tr");
+      tr.className = "result-chips-row";
+      if (selectedId === row.transect) tr.classList.add("is-selected");
+      const chips = scenarios.map((scenario) => {
+        const hyd = hydFor(row, scenario.key);
+        return `<span class="ari-chip" style="--ari-color:${scenario.color}"><i class="ari-swatch" style="background:${scenario.color}"></i>${scenario.label.replace(" ARI", "")} · ${hydStatusHtml(hyd)}</span>`;
+      }).join("");
+      tr.innerHTML = `
+        <td><span class="result-card-label">Transect</span>${row.transect}</td>
+        <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
+        <td colspan="5"><div class="ari-chips">${chips}</div></td>`;
+      bindRow(tr);
+      resultsBody.appendChild(tr);
+    } else {
+      scenarios.forEach((scenario, index) => {
+        const hyd = hydFor(row, scenario.key);
+        const tr = document.createElement("tr");
+        tr.className = "result-ari-row";
+        if (index === 0) tr.classList.add("is-first");
+        tr.style.setProperty("--ari-color", scenario.color || "#0284c7");
+        tr.dataset.ari = String(scenario.years);
+        tr.dataset.transect = String(row.transect);
+        if (selectedId === row.transect) tr.classList.add("is-selected");
+        tr.innerHTML = `
+          <td><span class="result-card-label">Transect</span>${row.transect}</td>
+          <td><span class="result-card-label">Offset</span>${fmt(row.offset_m, 1)}</td>
+          <td><span class="result-card-label">Return period</span><span class="ari-cell"><i class="ari-swatch" style="background:${scenario.color}"></i>${scenario.label.replace(" ARI", "")}</span></td>
+          <td><span class="result-card-label">Flow</span>${fmt(scenario.flow_m3_s, 1)}</td>
+          <td class="wl-cell"><span class="result-card-label">Water level</span>${fmt(hyd.water_level_m, 2)} <span class="max-depth">(max ${fmt(hyd.max_depth_m, 2)})</span></td>
+          <td><span class="result-card-label">Velocity</span>${fmt(hyd.velocity_m_s, 2)}</td>
+          <td><span class="result-card-label">Status</span>${hydStatusHtml(hyd)}</td>`;
+        bindRow(tr);
+        resultsBody.appendChild(tr);
+      });
+    }
 
     if (showCenterline) return;
     if (selectedId != null && selectedId !== row.transect) return;
     const fig = document.createElement("figure");
+    const hydNote = scenarios.map((scenario) => {
+      const hyd = hydFor(row, scenario.key);
+      return `${scenario.label.replace(" ARI", "")} WL ${fmt(hyd.water_level_m, 2)} m`;
+    }).join(" · ");
     fig.innerHTML = `
       <img src="${row.plot}" alt="Cross-section for transect ${row.transect}">
       <figcaption>Transect ${row.transect} · offset ${fmt(row.offset_m, 0)} m
-        · water level ${fmt(hyd.water_level_m, 2)} m
+        ${hydNote ? ` · ${hydNote}` : ""}
         · <a href="${row.csv}">CSV</a></figcaption>`;
     plotsEl.appendChild(fig);
   });
@@ -1777,6 +1855,14 @@ clearXsBtn.addEventListener("click", () => {
     setCoach("Left-click two points on the DEM to draw a cross-section.");
   }
 });
+
+if (resultsAriToggle) {
+  resultsAriToggle.addEventListener("click", (event) => {
+    event.preventDefault();
+    resultsArisExpanded = !resultsArisExpanded;
+    if (lastRun) renderResults(lastRun, { scroll: false });
+  });
+}
 
 runForm.addEventListener("click", (event) => {
   const btn = event.target.closest(".help");
