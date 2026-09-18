@@ -51,6 +51,7 @@ except Exception as e:
 
 from matplotlib.colors import LightSource
 from PIL import Image
+from excel_report import write_screening_workbook
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -2276,17 +2277,6 @@ def plot_cross_section(dists, elevs, out_png, water_level=None, water_levels=Non
 DATA_SHEET_COLUMNS = ["ID", "Transect ID", "Distance_m", "Elevation_m"]
 
 
-def write_screening_workbook(path, summary_rows, data_rows):
-    """Write summary.xlsx with a SUMMARY sheet and a DATA sheet of sample points."""
-    path = Path(path)
-    summary_df = pd.DataFrame(summary_rows)
-    data_df = pd.DataFrame(data_rows, columns=DATA_SHEET_COLUMNS)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="SUMMARY", index=False)
-        data_df.to_excel(writer, sheet_name="DATA", index=False)
-    return path
-
-
 def centerline_from_coords(coords):
     """Build a river centreline from [[lon, lat], ...] vertices."""
     if not coords or len(coords) < 2:
@@ -2341,6 +2331,7 @@ def run_screening(
     upstream_m=None,
     downstream_m=None,
     lateral_m=None,
+    bridge_name=None,
 ):
     """Run hydraulic screening at a bridge coordinate. Returns a result dict."""
     outdir = Path(outdir)
@@ -2520,6 +2511,7 @@ def run_screening(
     excel_rows = []
     data_rows = []
     transect_features = []
+    workbook_transects = []
     point_id = 1
     with rasterio.open(dem_path) as dem_src:
         slope, cl_dists, cl_elevs, fit_slope, fit_intercept = centerline_slope_and_profile(
@@ -2581,10 +2573,20 @@ def run_screening(
                 water_level=primary_stats.get("water_level_m"),
                 water_levels=plot_levels,
             )
+            sample_preview = sample_coords
+            if len(sample_preview) > 80:
+                step = max(1, len(sample_preview) // 80)
+                sample_preview = sample_preview[::step]
+                if sample_preview[-1] != sample_coords[-1]:
+                    sample_preview.append(sample_coords[-1])
+            profile = _profile_json(dists, elevs)
+            mid = tran.interpolate(0.5, normalized=True)
+            station_m, _ = centerline_bridge_station_m(reach, mid.x, mid.y)
             stats = dict(primary_stats)
             stats.update({
                 "transect": i + 1,
                 "offset_m": float(offset),
+                "station_m": float(station_m),
                 "n_samples": int(len(dists)),
                 "sample_spacing_m": float(sample_spacing),
                 "csv": str(csv_path),
@@ -2599,6 +2601,19 @@ def run_screening(
                     excel_row[f"{key}_velocity_m_s"] = slim.get("velocity_m_s")
                     excel_row[f"{key}_discharge_m3_s"] = slim.get("discharge_m3_s")
             excel_rows.append(excel_row)
+            workbook_transects.append({
+                "transect": i + 1,
+                "offset_m": float(offset),
+                "station_m": float(station_m),
+                "coords": [[x, y] for x, y in tran.coords],
+                "distance_m": profile["distance_m"],
+                "elevation_m": profile["elevation_m"],
+                "longitude": [xy[0] for xy in sample_coords],
+                "latitude": [xy[1] for xy in sample_coords],
+                "n_samples": int(len(dists)),
+                "sample_spacing_m": float(sample_spacing),
+                "aris": aris,
+            })
             for dist, elev in zip(dists, elevs):
                 data_rows.append({
                     "ID": point_id,
@@ -2607,15 +2622,6 @@ def run_screening(
                     "Elevation_m": float(elev) if np.isfinite(elev) else np.nan,
                 })
                 point_id += 1
-            sample_preview = sample_coords
-            if len(sample_preview) > 80:
-                step = max(1, len(sample_preview) // 80)
-                sample_preview = sample_preview[::step]
-                if sample_preview[-1] != sample_coords[-1]:
-                    sample_preview.append(sample_coords[-1])
-            profile = _profile_json(dists, elevs)
-            mid = tran.interpolate(0.5, normalized=True)
-            station_m, _ = centerline_bridge_station_m(reach, mid.x, mid.y)
             transect_features.append({
                 "transect": i + 1,
                 "offset_m": float(offset),
@@ -2634,8 +2640,38 @@ def run_screening(
 
     check_cancelled(cancel_event)
     summary_path = outdir / "summary.xlsx"
-    write_screening_workbook(summary_path, excel_rows, data_rows)
-    logging.info("Wrote summary workbook to %s (%d sample points)", summary_path, len(data_rows))
+    write_screening_workbook(
+        summary_path,
+        summary_rows=excel_rows,
+        data_rows=data_rows,
+        project={
+            "bridge_name": bridge_name,
+            "lat": lat,
+            "lon": lon,
+            "centerline_source": centerline_source,
+        },
+        layout={
+            "along_m": float(along_m) if along_m is not None else None,
+            "interval_m": float(interval),
+            "transect_length_m": float(length),
+            "sample_spacing_m": float(sample_spacing),
+            "n_transects": len(transects),
+            "flow_m3_s": float(primary_flow),
+            "mannings_n": float(mannings_n),
+            "slope": float(slope),
+            "dem_source": dem_source_used,
+            "dem_file": kept_dem.name if kept_dem else None,
+            "upstream_m": float(plan["upstream_m"]),
+            "downstream_m": float(plan["downstream_m"]),
+            "lateral_m": float(plan["lateral_m"]),
+            "tiles": list(linz_tiles),
+            "centerline_source": centerline_source,
+        },
+        scenarios=scenarios,
+        transects=workbook_transects,
+        centerline_profile=cl_json,
+    )
+    logging.info("Wrote summary workbook to %s", summary_path)
 
     if temp_dir:
         logging.info("Temporary DEM stored in %s", temp_dir)

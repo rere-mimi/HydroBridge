@@ -289,7 +289,7 @@
       <h2>Screening results</h2>
       <div class="results-actions">
         <button type="button" id="results-ari-toggle" class="ghost" hidden>Collapse return periods</button>
-        <a id="summary-link" href="#" hidden>Download summary.xlsx</a>
+        <a id="summary-link" href="#" hidden>Download results workbook</a>
       </div>
     </div>
     <p id="results-note" class="muted"></p>
@@ -300,6 +300,6 @@
   <div id="xs-measure" class="xs-measure" hidden role="status" aria-live="polite">0.0 m</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=connected-wet"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=excel-workbook"></script>
 </body>
 </html>
