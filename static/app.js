@@ -2317,6 +2317,7 @@ runForm.addEventListener("submit", async (event) => {
   if (flowPrimary) body.set("flow", flowPrimary.value);
   const jobId = newJobId();
   body.set("job_id", jobId);
+  if (bridgeName) body.set("bridge_name", bridgeName);
   runJobId = jobId;
   runAbort = new AbortController();
   setRunning(true);

@@ -363,6 +363,7 @@ def run():
             upstream_m=aoi["upstream_m"],
             downstream_m=aoi["downstream_m"],
             lateral_m=aoi["lateral_m"],
+            bridge_name=(request.form.get("bridge_name") or "").strip()[:120] or None,
         )
     except HydroScreenCancelled:
         return jsonify({"cancelled": True, "error": "Screening stopped."}), 409

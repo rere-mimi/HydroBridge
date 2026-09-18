@@ -74,7 +74,7 @@ class UiMarkupTests(unittest.TestCase):
         self.assertNotIn(">Samples<", html)
         self.assertNotIn("Hyd. radius", html)
         self.assertNotIn('id="results-table"', html)
-        self.assertIn("plus 50 m at each end", html)
+        self.assertIn("Download results workbook", html)
         css = Path(__file__).resolve().parents[1] / "static" / "style.css"
         styles = css.read_text(encoding="utf-8")
         self.assertIn("max-height: calc(100dvh - 6.2rem)", styles)
