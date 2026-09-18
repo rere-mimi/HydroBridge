@@ -692,6 +692,17 @@ button { font: inherit; cursor: pointer; }
   color: var(--accent-dark);
 }
 
+.clip-dem {
+  width: 100%;
+  margin-top: 0.7rem;
+  font-weight: 650;
+}
+
+.clip-dem:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .ghost {
   border: 1px solid var(--line);
   background: white;

@@ -111,7 +111,7 @@ class AoiGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(aoi["along_m"], 1500.0, places=5)
         self.assertAlmostEqual(aoi["width_m"], 1000.0, places=5)
         self.assertLess(aoi_native_pixels(aoi["along_m"], aoi["width_m"]), DEM_MAX_PIXELS)
-        self.assertGreaterEqual(preview_resolution_m(1500, 1000), 2.0)
+        self.assertGreaterEqual(preview_resolution_m(1500, 1000), 4.0)
 
     def test_rejects_a_1m_clip_that_exceeds_the_pixel_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,7 +212,7 @@ class WindowedExtractTests(unittest.TestCase):
                         )
         self.assertTrue(any(event.get("done") for event in events))
         self.assertIsNotNone(seen.get("resolution"))
-        self.assertGreaterEqual(seen["resolution"], 2.0)
+        self.assertGreaterEqual(seen["resolution"], 4.0)
 
     def test_extract_reuses_a_local_sheet_if_already_on_disk(self):
         seen = {}
