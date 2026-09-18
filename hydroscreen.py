@@ -8,7 +8,8 @@ Hydraulic screening MVP
 - Exports CSV/Excel and plots
 - Estimates bed slope from the river centreline, then raises water level on
   each transect (trapezoidal area / hydraulic radius) until Manning Q matches
-  the specified flow
+  the specified flow. Only the wet interval connected to the main channel
+  counts; isolated depressions below the water surface are ignored.
 
 Usage examples are in README.md
 """
@@ -1749,14 +1750,176 @@ def haversine(lon1, lat1, lon2, lat2):
 
 # Basic hydraulic checks
 
-def hydraulics_at_stage(dists, elevs, water_level):
-    """Trapezoidal area and wetted perimeter at a water-surface elevation."""
+def _empty_hydraulics():
+    return {
+        "area_m2": 0.0,
+        "wetted_perimeter_m": 0.0,
+        "top_width_m": 0.0,
+        "hydraulic_radius_m": 0.0,
+        "connected_spans": [],
+        "connected_bed_m": None,
+    }
+
+
+def default_channel_station_m(dists):
+    """Station of the main-channel seed: the transect midpoint (centreline crossing)."""
+    finite = [float(x) for x in np.asarray(dists, dtype=float) if np.isfinite(x)]
+    if not finite:
+        return 0.0
+    return 0.5 * (finite[0] + finite[-1])
+
+
+def main_channel_bed_m(dists, elevs, channel_station_m=None):
+    """Lowest bed in a window around the main-channel station, not a far floodplain pit."""
+    dists = np.asarray(dists, dtype=float)
+    elevs = np.asarray(elevs, dtype=float)
+    if len(dists) == 0:
+        return None
+    seed_x = (
+        float(channel_station_m)
+        if channel_station_m is not None and np.isfinite(channel_station_m)
+        else default_channel_station_m(dists)
+    )
+    finite = np.isfinite(dists) & np.isfinite(elevs)
+    if not finite.any():
+        return None
+    span = float(np.nanmax(dists) - np.nanmin(dists)) if finite.sum() else 0.0
+    window = max(5.0, 0.25 * span)
+    nearby = finite & (np.abs(dists - seed_x) <= window)
+    if not nearby.any():
+        nearby = finite
+    return float(np.min(elevs[nearby]))
+
+
+def _sample_is_wet(elev, water_level):
+    return np.isfinite(elev) and (float(water_level) - float(elev)) > 0.0
+
+
+def _waterline_station(x1, z1, x2, z2, water_level):
+    if not (np.isfinite(x1) and np.isfinite(x2) and np.isfinite(z1) and np.isfinite(z2)):
+        return None
+    d1 = float(water_level) - float(z1)
+    d2 = float(water_level) - float(z2)
+    if d1 > 0 and d2 > 0:
+        return None
+    if d1 <= 0 and d2 <= 0:
+        return None
+    if z2 == z1:
+        return float(x1)
+    t = (float(water_level) - float(z1)) / (float(z2) - float(z1))
+    t = min(max(t, 0.0), 1.0)
+    return float(x1 + t * (x2 - x1))
+
+
+def connected_wetted_span(dists, elevs, water_level, channel_station_m=None):
+    """Wet sample range hydraulically connected to the main channel.
+
+    High ground at or above the water surface is a barrier, so a floodplain
+    depression that the waterline intersects is ignored unless the intervening
+    ridge is overtopped. The main channel is the transect midpoint (the
+    centreline crossing) unless *channel_station_m* is set.
+
+    Returns a dict with inclusive sample indices and bank stations, or None
+    when the channel is dry.
+    """
+    dists = np.asarray(dists, dtype=float)
+    elevs = np.asarray(elevs, dtype=float)
+    n = len(dists)
+    if n == 0 or not np.isfinite(water_level):
+        return None
+    seed_x = (
+        float(channel_station_m)
+        if channel_station_m is not None and np.isfinite(channel_station_m)
+        else default_channel_station_m(dists)
+    )
+    wet = [_sample_is_wet(elevs[i], water_level) for i in range(n)]
+    seed = None
+    best = float("inf")
+    for i in range(n):
+        if not np.isfinite(dists[i]):
+            continue
+        gap = abs(float(dists[i]) - seed_x)
+        if gap < best:
+            best = gap
+            seed = i
+    if seed is None:
+        return None
+    if not wet[seed]:
+        near = None
+        near_d = float("inf")
+        near_z = float("inf")
+        for i in range(n):
+            if not wet[i] or not np.isfinite(dists[i]):
+                continue
+            gap = abs(float(dists[i]) - seed_x)
+            z = float(elevs[i])
+            if gap < near_d - 1e-9 or (abs(gap - near_d) <= 1e-9 and z < near_z):
+                near = i
+                near_d = gap
+                near_z = z
+        if near is None:
+            return None
+        seed = near
+    i_left = seed
+    while i_left > 0 and wet[i_left - 1]:
+        i_left -= 1
+    i_right = seed
+    while i_right < n - 1 and wet[i_right + 1]:
+        i_right += 1
+    x_left = float(dists[i_left])
+    if i_left > 0:
+        bank = _waterline_station(
+            dists[i_left - 1], elevs[i_left - 1], dists[i_left], elevs[i_left], water_level
+        )
+        if bank is not None:
+            x_left = bank
+    x_right = float(dists[i_right])
+    if i_right < n - 1:
+        bank = _waterline_station(
+            dists[i_right], elevs[i_right], dists[i_right + 1], elevs[i_right + 1], water_level
+        )
+        if bank is not None:
+            x_right = bank
+    bed = [float(elevs[i]) for i in range(i_left, i_right + 1) if np.isfinite(elevs[i])]
+    return {
+        "i_left": int(i_left),
+        "i_right": int(i_right),
+        "x_left": float(x_left),
+        "x_right": float(x_right),
+        "bed_m": float(min(bed)) if bed else None,
+    }
+
+
+def connected_wet_mask(dists, elevs, water_level, channel_station_m=None):
+    """Boolean mask of samples in the channel-connected wet interval."""
+    dists = np.asarray(dists, dtype=float)
+    mask = np.zeros(len(dists), dtype=bool)
+    span = connected_wetted_span(dists, elevs, water_level, channel_station_m=channel_station_m)
+    if not span:
+        return mask
+    mask[span["i_left"] : span["i_right"] + 1] = True
+    return mask
+
+
+def hydraulics_at_stage(dists, elevs, water_level, channel_station_m=None):
+    """Trapezoidal area and wetted perimeter at a water-surface elevation.
+
+    Only the wet interval continuously connected to the main channel is
+    included. Isolated depressions below the water surface do not add area,
+    wetted perimeter, top width, or hydraulic radius.
+    """
+    empty = _empty_hydraulics()
     if len(dists) < 2:
-        return {"area_m2": 0.0, "wetted_perimeter_m": 0.0, "top_width_m": 0.0, "hydraulic_radius_m": 0.0}
+        return empty
+    span = connected_wetted_span(dists, elevs, water_level, channel_station_m=channel_station_m)
+    if not span:
+        return empty
+    i_first = 0 if span["i_left"] == 0 else span["i_left"] - 1
+    i_last = len(dists) - 2 if span["i_right"] >= len(dists) - 1 else span["i_right"]
     area = 0.0
     perimeter = 0.0
     top_width = 0.0
-    for i in range(len(dists) - 1):
+    for i in range(i_first, i_last + 1):
         x1, x2 = float(dists[i]), float(dists[i + 1])
         z1, z2 = float(elevs[i]), float(elevs[i + 1])
         if not (np.isfinite(x1) and np.isfinite(x2) and np.isfinite(z1) and np.isfinite(z2)):
@@ -1793,6 +1956,8 @@ def hydraulics_at_stage(dists, elevs, water_level):
         "wetted_perimeter_m": float(perimeter),
         "top_width_m": float(top_width),
         "hydraulic_radius_m": float(radius),
+        "connected_spans": [[span["x_left"], span["x_right"]]],
+        "connected_bed_m": span.get("bed_m"),
     }
 
 
@@ -1819,6 +1984,7 @@ ARI_STAT_KEYS = (
     "depth_mean_m",
     "wetted_perimeter_m",
     "hydraulic_radius_m",
+    "connected_spans",
     "velocity_m_s",
     "discharge_m3_s",
     "target_discharge_m3_s",
@@ -1923,8 +2089,20 @@ def _ari_hydraulics(stats, scenario):
     return slim
 
 
-def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, cancel_event=None):
-    """Raise water level along the transect until Manning Q matches the specified flow."""
+def solve_water_level(
+    dists,
+    elevs,
+    flow_m3_s,
+    mannings_n,
+    slope,
+    step_m=0.02,
+    cancel_event=None,
+    channel_station_m=None,
+):
+    """Raise water level along the transect until Manning Q matches the specified flow.
+
+    Conveyance uses only the wet interval connected to the main channel.
+    """
     finite = elevs[np.isfinite(elevs)]
     empty = {
         "water_level_m": None,
@@ -1934,6 +2112,7 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, c
         "depth_mean_m": 0.0,
         "wetted_perimeter_m": 0.0,
         "hydraulic_radius_m": 0.0,
+        "connected_spans": [],
         "velocity_m_s": 0.0,
         "discharge_m3_s": 0.0,
         "target_discharge_m3_s": float(flow_m3_s),
@@ -1944,50 +2123,57 @@ def solve_water_level(dists, elevs, flow_m3_s, mannings_n, slope, step_m=0.02, c
     }
     if len(finite) == 0:
         return empty
-    zmin = float(np.min(finite))
+    zmin_all = float(np.min(finite))
     zmax = float(np.max(finite))
+    z_channel = main_channel_bed_m(dists, elevs, channel_station_m)
+    if z_channel is None:
+        z_channel = zmin_all
     if flow_m3_s <= 0:
-        empty.update({"water_level_m": zmin, "conveys": True})
+        empty.update({"water_level_m": float(z_channel), "conveys": True, "connected_spans": []})
         return empty
 
     max_wse = zmax + 2.0
-    wse = zmin + step_m
-    hyd = hydraulics_at_stage(dists, elevs, wse)
+    wse = float(z_channel) + step_m
+    hyd = hydraulics_at_stage(dists, elevs, wse, channel_station_m=channel_station_m)
     velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
     # Increase stage until conveyance meets the target flow.
     while discharge < flow_m3_s and wse < max_wse:
         check_cancelled(cancel_event)
         wse += step_m
-        hyd = hydraulics_at_stage(dists, elevs, wse)
+        hyd = hydraulics_at_stage(dists, elevs, wse, channel_station_m=channel_station_m)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
 
     # Refine between the last two steps.
-    lo = max(zmin, wse - step_m)
+    lo = max(float(z_channel), wse - step_m)
     hi = wse
     for _ in range(24):
         check_cancelled(cancel_event)
         mid = 0.5 * (lo + hi)
-        hyd = hydraulics_at_stage(dists, elevs, mid)
+        hyd = hydraulics_at_stage(dists, elevs, mid, channel_station_m=channel_station_m)
         velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
         if discharge < flow_m3_s:
             lo = mid
         else:
             hi = mid
     wse = hi
-    hyd = hydraulics_at_stage(dists, elevs, wse)
+    hyd = hydraulics_at_stage(dists, elevs, wse, channel_station_m=channel_station_m)
     velocity, discharge = manning_discharge(hyd["area_m2"], hyd["hydraulic_radius_m"], mannings_n, slope)
     width = hyd["top_width_m"]
     area = hyd["area_m2"]
+    bed = hyd.get("connected_bed_m")
+    if bed is None:
+        bed = z_channel
     overtopped = wse >= (zmax - 1e-6)
     conveys = discharge + 1e-6 >= flow_m3_s
     return {
         "water_level_m": float(wse),
-        "max_depth_m": float(max(0.0, wse - zmin)),
+        "max_depth_m": float(max(0.0, wse - float(bed))),
         "width_m": float(width),
         "area_m2": float(area),
         "depth_mean_m": float(area / width) if width > 0 else 0.0,
         "wetted_perimeter_m": hyd["wetted_perimeter_m"],
         "hydraulic_radius_m": hyd["hydraulic_radius_m"],
+        "connected_spans": hyd.get("connected_spans") or [],
         "velocity_m_s": float(velocity),
         "discharge_m3_s": float(discharge),
         "target_discharge_m3_s": float(flow_m3_s),
@@ -2054,16 +2240,27 @@ def plot_cross_section(dists, elevs, out_png, water_level=None, water_levels=Non
         finite = elevs[np.isfinite(elevs)]
         y_floor = (np.min(finite) - 1) if len(finite) else -1
         if levels:
-            fill_one = len(levels) == 1
+            filled = False
             for item in levels:
                 level = item.get("water_level_m")
                 if level is None or not np.isfinite(level):
                     continue
                 color = item.get("color") or "#1f6f8b"
                 label = item.get("label") or "Water level"
-                if fill_one:
-                    wet = np.isfinite(elevs) & (elevs < level)
-                    ax.fill_between(dists, elevs, level, where=wet, color=color, alpha=0.35, interpolate=True)
+                wet = connected_wet_mask(dists, elevs, level)
+                if wet.any():
+                    fill_color = "#2563eb" if len(levels) == 1 else color
+                    ax.fill_between(
+                        dists,
+                        elevs,
+                        level,
+                        where=wet,
+                        color=fill_color,
+                        alpha=0.35 if len(levels) == 1 else 0.18,
+                        interpolate=True,
+                        label="Connected flow area" if not filled else "_nolegend_",
+                    )
+                    filled = True
                 ax.axhline(level, color=color, linestyle="--", linewidth=1.2, label=label)
             ax.legend(loc="best", frameon=False)
         else:

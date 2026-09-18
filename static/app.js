@@ -1112,6 +1112,132 @@ function strokePolyline(ctx, pts) {
   });
 }
 
+function isWetElev(z, level) {
+  return z != null && Number.isFinite(Number(z)) && Number(z) < Number(level);
+}
+
+function channelStationM(dists, explicit) {
+  if (explicit != null && Number.isFinite(Number(explicit))) return Number(explicit);
+  const finite = dists.map(Number).filter((x) => Number.isFinite(x));
+  if (!finite.length) return 0;
+  return 0.5 * (finite[0] + finite[finite.length - 1]);
+}
+
+function waterlineStation(dists, elevs, level, i1, i2) {
+  if (i1 < 0 || i2 >= dists.length) return null;
+  const x1 = Number(dists[i1]);
+  const x2 = Number(dists[i2]);
+  const z1 = Number(elevs[i1]);
+  const z2 = Number(elevs[i2]);
+  if (![x1, x2, z1, z2].every(Number.isFinite)) return null;
+  const d1 = Number(level) - z1;
+  const d2 = Number(level) - z2;
+  if (d1 > 0 && d2 > 0) return null;
+  if (d1 <= 0 && d2 <= 0) return null;
+  if (z2 === z1) return x1;
+  const t = Math.min(1, Math.max(0, (Number(level) - z1) / (z2 - z1)));
+  return x1 + t * (x2 - x1);
+}
+
+function connectedWettedSpan(dists, elevs, level, channelStation) {
+  const n = dists.length;
+  if (!n || !Number.isFinite(Number(level))) return null;
+  const seedX = channelStationM(dists, channelStation);
+  const wet = elevs.map((z) => isWetElev(z, level));
+  let seed = -1;
+  let best = Infinity;
+  for (let i = 0; i < n; i += 1) {
+    const x = Number(dists[i]);
+    if (!Number.isFinite(x)) continue;
+    const gap = Math.abs(x - seedX);
+    if (gap < best) {
+      best = gap;
+      seed = i;
+    }
+  }
+  if (seed < 0) return null;
+  if (!wet[seed]) {
+    let near = -1;
+    let nearD = Infinity;
+    let nearZ = Infinity;
+    for (let i = 0; i < n; i += 1) {
+      if (!wet[i]) continue;
+      const x = Number(dists[i]);
+      if (!Number.isFinite(x)) continue;
+      const gap = Math.abs(x - seedX);
+      const z = Number(elevs[i]);
+      if (gap < nearD - 1e-9 || (Math.abs(gap - nearD) <= 1e-9 && z < nearZ)) {
+        near = i;
+        nearD = gap;
+        nearZ = z;
+      }
+    }
+    if (near < 0) return null;
+    seed = near;
+  }
+  let iL = seed;
+  while (iL > 0 && wet[iL - 1]) iL -= 1;
+  let iR = seed;
+  while (iR < n - 1 && wet[iR + 1]) iR += 1;
+  const xL = waterlineStation(dists, elevs, level, iL - 1, iL);
+  const xR = waterlineStation(dists, elevs, level, iR, iR + 1);
+  return [xL == null ? Number(dists[iL]) : xL, xR == null ? Number(dists[iR]) : xR];
+}
+
+function interpolateProfileZ(dists, elevs, x) {
+  let lo = -1;
+  for (let i = 0; i < dists.length; i += 1) {
+    const xi = Number(dists[i]);
+    const zi = Number(elevs[i]);
+    if (!Number.isFinite(xi) || !Number.isFinite(zi)) continue;
+    if (xi === x) return zi;
+    if (xi < x) lo = i;
+    if (xi > x) {
+      if (lo < 0) return zi;
+      const x0 = Number(dists[lo]);
+      const z0 = Number(elevs[lo]);
+      if (x === x0) return z0;
+      const t = (x - x0) / (xi - x0);
+      return z0 + t * (zi - z0);
+    }
+  }
+  if (lo >= 0) return Number(elevs[lo]);
+  return null;
+}
+
+function groundPointsBetween(dists, elevs, xL, xR) {
+  const pts = [];
+  const zL = interpolateProfileZ(dists, elevs, xL);
+  if (zL != null && Number.isFinite(zL)) pts.push({ x: xL, z: zL });
+  for (let i = 0; i < dists.length; i += 1) {
+    const x = Number(dists[i]);
+    const z = Number(elevs[i]);
+    if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+    if (x > xL && x < xR) pts.push({ x, z });
+  }
+  const zR = interpolateProfileZ(dists, elevs, xR);
+  if (zR != null && Number.isFinite(zR)) pts.push({ x: xR, z: zR });
+  return pts;
+}
+
+function fillConnectedWater(ctx, dists, elevs, xOf, yOf, level, span, color) {
+  if (!span || span.length < 2) return;
+  const xL = Number(span[0]);
+  const xR = Number(span[1]);
+  if (!Number.isFinite(xL) || !Number.isFinite(xR) || xR <= xL) return;
+  const ground = groundPointsBetween(dists, elevs, xL, xR);
+  if (ground.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(xOf(ground[0].x), yOf(level));
+  ground.forEach((pt) => ctx.lineTo(xOf(pt.x), yOf(pt.z)));
+  ctx.lineTo(xOf(ground[ground.length - 1].x), yOf(level));
+  ctx.closePath();
+  ctx.globalAlpha = 0.32;
+  ctx.fillStyle = color || "#2563eb";
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
 function drawXsProfile(profile, options = {}) {
   if (!xsCanvas || !profile) return;
   const dists = profile.distance_m || [];
@@ -1149,7 +1275,7 @@ function drawXsProfile(profile, options = {}) {
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, cssW, cssH);
 
-  const legendCount = 1 + (slope ? 1 : 0) + Math.max(waterLevels.length, series.length) + ((options.stations || []).length ? 1 : 0);
+  const legendCount = 1 + (slope ? 1 : 0) + (waterLevels.length ? 1 : 0) + Math.max(waterLevels.length, series.length) + ((options.stations || []).length ? 1 : 0);
   const pad = {
     left: 52,
     right: hasVelocity ? 54 : 18,
@@ -1286,34 +1412,15 @@ function drawXsProfile(profile, options = {}) {
     ctx.setLineDash([]);
   }
 
-  if (waterLevels.length === 1) {
-    const level = Number(waterLevels[0].value);
-    ctx.beginPath();
-    let drawing = false;
-    let started = false;
-    dists.forEach((dist, i) => {
-      const z = elevs[i];
-      if (z == null || !Number.isFinite(Number(z)) || Number(z) >= level) {
-        drawing = false;
-        return;
-      }
-      const x = xOf(dist);
-      const yGround = yOf(Number(z));
-      const yWater = yOf(level);
-      if (!drawing) {
-        if (!started) ctx.moveTo(x, yGround);
-        else ctx.lineTo(x, yGround);
-        ctx.lineTo(x, yWater);
-        drawing = true;
-        started = true;
-      } else {
-        ctx.lineTo(x, yWater);
-      }
+  if (waterLevels.length) {
+    waterLevels.forEach((item) => {
+      const level = Number(item.value);
+      const spans = Array.isArray(item.connectedSpans) && item.connectedSpans.length
+        ? item.connectedSpans
+        : [connectedWettedSpan(dists, elevs, level)].filter(Boolean);
+      const fillColor = waterLevels.length === 1 ? "#2563eb" : (item.color || "#2563eb");
+      spans.forEach((span) => fillConnectedWater(ctx, dists, elevs, xOf, yOf, level, span, fillColor));
     });
-    ctx.globalAlpha = 0.18;
-    ctx.fillStyle = waterLevels[0].color || "#0284c7";
-    ctx.fill();
-    ctx.globalAlpha = 1;
   }
 
   waterLevels.forEach((item) => {
@@ -1358,6 +1465,9 @@ function drawXsProfile(profile, options = {}) {
   const legend = [];
   legend.push({ color: "#0f172a", text: "Ground", dash: [] });
   if (slope) legend.push({ color: "#92400e", text: `Slope S = ${formatSlope(slope.abs)}`, dash: [4, 4] });
+  if (waterLevels.length) {
+    legend.push({ color: "#2563eb", text: "Blue fill = connected flow area", dash: [] });
+  }
   waterLevels.forEach((item) => {
     const bits = [item.label || "Water level", `WL ${Number(item.value).toFixed(2)} m`];
     if (item.velocity != null && Number.isFinite(Number(item.velocity))) {
@@ -1666,6 +1776,7 @@ function showSelectedProfile() {
         color: scenario.color,
         label: scenario.label,
         flow: scenario.flow_m3_s,
+        connectedSpans: hyd.connected_spans,
       };
     }).filter((item) => item.value != null && Number.isFinite(Number(item.value)));
     xsProfile = {

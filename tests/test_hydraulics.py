@@ -11,6 +11,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import LineString
 
 from hydroscreen import (
+    connected_wet_mask,
     estimate_centerline_slope,
     hydraulics_at_stage,
     manning_discharge,
@@ -99,6 +100,59 @@ class CenterlineSlopeTests(unittest.TestCase):
         # ~6 m over ~470 m of ground distance around this latitude.
         self.assertGreater(slope, 0.008)
         self.assertLess(slope, 0.02)
+
+
+class ConnectedWettedAreaTests(unittest.TestCase):
+    def setUp(self):
+        # 200 m transect centred on the river, with an isolated pit on the right.
+        self.dists = np.array([0.0, 20.0, 80.0, 90.0, 100.0, 110.0, 120.0, 160.0, 180.0, 200.0])
+        self.elevs = np.array([5.0, 4.0, 3.0, 0.0, 0.0, 0.0, 3.0, 4.0, 1.0, 5.0])
+        self.channel_dists = np.array([80.0, 90.0, 100.0, 110.0, 120.0])
+        self.channel_elevs = np.array([3.0, 0.0, 0.0, 0.0, 3.0])
+        self.pit_dists = np.array([160.0, 180.0, 200.0])
+        self.pit_elevs = np.array([4.0, 1.0, 5.0])
+
+    def test_disconnected_pit_is_excluded_at_low_stage(self):
+        hyd = hydraulics_at_stage(self.dists, self.elevs, 2.0)
+        channel = hydraulics_at_stage(self.channel_dists, self.channel_elevs, 2.0)
+        pit = hydraulics_at_stage(self.pit_dists, self.pit_elevs, 2.0)
+        self.assertGreater(pit["area_m2"], 1.0)
+        self.assertAlmostEqual(hyd["area_m2"], channel["area_m2"], places=5)
+        self.assertAlmostEqual(hyd["wetted_perimeter_m"], channel["wetted_perimeter_m"], places=5)
+        self.assertAlmostEqual(hyd["top_width_m"], channel["top_width_m"], places=5)
+        self.assertAlmostEqual(hyd["hydraulic_radius_m"], channel["hydraulic_radius_m"], places=5)
+        self.assertEqual(len(hyd["connected_spans"]), 1)
+        self.assertLess(hyd["connected_spans"][0][1], 160.0)
+        mask = connected_wet_mask(self.dists, self.elevs, 2.0)
+        self.assertTrue(bool(mask[4]))
+        self.assertFalse(bool(mask[8]))
+
+    def test_pit_joins_once_the_ridge_is_overtopped(self):
+        hyd = hydraulics_at_stage(self.dists, self.elevs, 4.5)
+        channel = hydraulics_at_stage(self.channel_dists, self.channel_elevs, 4.5)
+        self.assertGreater(hyd["area_m2"], channel["area_m2"] + 1.0)
+        self.assertGreater(hyd["connected_spans"][0][1], 160.0)
+        mask = connected_wet_mask(self.dists, self.elevs, 4.5)
+        self.assertTrue(bool(mask[8]))
+
+    def test_max_depth_uses_the_channel_bed_not_a_deeper_pit(self):
+        elevs = self.elevs.copy()
+        elevs[8] = -3.0
+        result = solve_water_level(self.dists, elevs, 5.0, 0.035, 0.002)
+        self.assertTrue(result["conveys"])
+        self.assertAlmostEqual(result["max_depth_m"], result["water_level_m"], delta=0.15)
+        self.assertLess(result["connected_spans"][0][1], 160.0)
+
+    def test_solve_matches_the_channel_only_section_while_the_pit_is_dry(self):
+        n = 0.035
+        slope = 0.002
+        target = 8.0
+        full = solve_water_level(self.dists, self.elevs, target, n, slope)
+        channel = solve_water_level(self.channel_dists, self.channel_elevs, target, n, slope)
+        self.assertLess(full["water_level_m"], 4.0)
+        self.assertAlmostEqual(full["water_level_m"], channel["water_level_m"], places=3)
+        self.assertAlmostEqual(full["area_m2"], channel["area_m2"], places=3)
+        self.assertAlmostEqual(full["discharge_m3_s"], channel["discharge_m3_s"], places=3)
 
 
 if __name__ == "__main__":
