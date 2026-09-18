@@ -79,6 +79,12 @@ class UiMarkupTests(unittest.TestCase):
         styles = css.read_text(encoding="utf-8")
         self.assertIn("max-height: calc(100dvh - 6.2rem)", styles)
         self.assertIn("overscroll-behavior: contain", styles)
+        js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+        client = js.read_text(encoding="utf-8")
+        self.assertNotIn("scheduleDemPreview", client)
+        self.assertIn("function clipSelectedDem()", client)
+        self.assertIn('clipDemBtn.addEventListener("click", clipSelectedDem)', client)
+        self.assertEqual(client.count("refreshDemOverlay();"), 1)
 
     def test_dem_preview_stream_reports_percent(self):
         with patch("hydroscreen.iter_extract_linz_dem_for_bridge", side_effect=_fake_iter_extract):

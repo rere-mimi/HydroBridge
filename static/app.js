@@ -1619,6 +1619,7 @@ function placeBridge(lat, lon, name) {
   centerlineFinished = false;
   ranTransects = false;
   overlay.clearLayers();
+  invalidateDemClip();
   redrawDraft();
   resultsEl.hidden = true;
   lastRun = null;
