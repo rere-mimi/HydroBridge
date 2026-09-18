@@ -24,6 +24,7 @@ const modeXsBtn = document.getElementById("mode-xs");
 const undoBtn = document.getElementById("undo-vertex");
 const clearBtn = document.getElementById("clear-line");
 const finishBtn = document.getElementById("finish-line");
+const clipDemBtn = document.getElementById("clip-dem");
 const clearXsBtn = document.getElementById("clear-xs");
 const layoutPreview = document.getElementById("layout-preview");
 const analysisLengthEl = document.getElementById("analysis-length");
@@ -278,6 +279,7 @@ let lastPreviewKey = "";
 let demTiles = [];
 let aoiFromServer = null;
 let demProgressOn = false;
+let demClipBusy = false;
 let demTransparency = 50;
 var lastRun = null;
 var selectedSection = null;
@@ -747,7 +749,8 @@ function updateLayoutPreview() {
     : `drawn ${along.toFixed(0)} m`;
   layoutPreview.textContent = `${nTransects} transects along the ${reachNote} · ${nSamples} DEM points each · ${ariNote}${extra}`;
   const windowM = aoiWindowM();
-  layoutPreview.textContent = `${layoutPreview.textContent} · DEM ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m`;
+  const clipNote = demClipIsCurrent() ? "clipped" : "click Clip DEM to download";
+  layoutPreview.textContent = `${layoutPreview.textContent} · DEM ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m (${clipNote})`;
   updateAoiSize();
   runReady = Boolean(marker);
   runBlockReason = marker
@@ -778,6 +781,7 @@ function syncChrome() {
   }
   refreshLegend();
   updateLayoutPreview();
+  syncClipDemButton();
   adaptMapLayout();
 }
 
@@ -799,9 +803,50 @@ function clearDemOverlay() {
   refreshLegend();
 }
 
-function scheduleDemPreview() {
+function currentAoiKey() {
+  const { lat, lon } = currentLatLon();
+  if (Number.isNaN(lat) || Number.isNaN(lon)) return "";
+  const ext = aoiExtents();
+  const drawnKey = drawnLatLngs.length >= 2
+    ? drawnLatLngs.map((ll) => `${ll.lat.toFixed(5)},${ll.lng.toFixed(5)}`).join(";")
+    : "";
+  return [lat.toFixed(5), lon.toFixed(5), ext.upstream, ext.downstream, ext.lateral, drawnKey].join("|");
+}
+
+function demClipIsCurrent() {
+  return Boolean(demOverlay && lastPreviewKey && lastPreviewKey === currentAoiKey());
+}
+
+function syncClipDemButton() {
+  if (!clipDemBtn) return;
+  clipDemBtn.disabled = !marker || demClipBusy;
+  if (demClipBusy) {
+    clipDemBtn.textContent = "Clipping DEM…";
+  } else if (demClipIsCurrent()) {
+    clipDemBtn.textContent = "DEM clipped";
+  } else {
+    clipDemBtn.textContent = "Clip DEM";
+  }
+}
+
+function invalidateDemClip() {
   clearTimeout(demPreviewTimer);
-  demPreviewTimer = setTimeout(refreshDemOverlay, 700);
+  demPreviewTimer = null;
+  aoiFromServer = null;
+  if (demOverlay || lastPreviewKey) {
+    lastPreviewKey = "";
+    clearDemOverlay();
+  }
+  syncClipDemButton();
+}
+
+function clipSelectedDem() {
+  const { lat, lon } = currentLatLon();
+  if (!marker || Number.isNaN(lat) || Number.isNaN(lon)) {
+    setStatus("Pin a bridge first, then clip the orange rectangle.", "error");
+    return;
+  }
+  refreshDemOverlay();
 }
 
 async function readPreviewStream(res) {
@@ -842,19 +887,12 @@ async function readPreviewStream(res) {
 async function refreshDemOverlay() {
   const { lat, lon } = currentLatLon();
   if (Number.isNaN(lat) || Number.isNaN(lon)) return;
-  const ext = aoiExtents();
-  const drawnKey = drawnLatLngs.length >= 2
-    ? drawnLatLngs.map((ll) => `${ll.lat.toFixed(5)},${ll.lng.toFixed(5)}`).join(";")
-    : "";
-  const key = [
-    lat.toFixed(5),
-    lon.toFixed(5),
-    ext.upstream,
-    ext.downstream,
-    ext.lateral,
-    drawnKey,
-  ].join("|");
-  if (key === lastPreviewKey && demOverlay) return;
+  const key = currentAoiKey();
+  if (key === lastPreviewKey && demOverlay) {
+    setStatus("This rectangle is already clipped.", "ok");
+    syncClipDemButton();
+    return;
+  }
   const seq = (demPreviewSeq += 1);
   const body = new FormData();
   body.set("lat", String(lat));
@@ -865,10 +903,12 @@ async function refreshDemOverlay() {
   appendAoiFields(body);
   const windowM = aoiWindowM();
   const large = windowM.along * windowM.width > 500 * 500;
+  demClipBusy = true;
+  syncClipDemButton();
   showDemProgress(
     0,
     large
-      ? `Fetching a ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m LiDAR window…`
+      ? `Clipping a ${windowM.along.toFixed(0)} × ${windowM.width.toFixed(0)} m LiDAR window…`
       : "Finding LINZ tiles…"
   );
   try {
@@ -901,17 +941,23 @@ async function refreshDemOverlay() {
     redrawAoi(aoiFromServer, { fit: true });
     lastPreviewKey = key;
     refreshLegend();
+    syncClipDemButton();
     adaptMapLayout();
     if (!data.aoi) {
       map.fitBounds(data.bounds, { padding: [28, 28], maxZoom: 17, animate: false });
     }
+    setStatus("DEM clipped to the orange rectangle.", "ok");
   } catch (err) {
     if (seq !== demPreviewSeq) return;
     clearDemOverlay();
     lastPreviewKey = "";
     setStatus((err && err.message) || "Could not download the LINZ DEM.", "error");
   } finally {
-    if (seq === demPreviewSeq) hideDemProgress();
+    if (seq === demPreviewSeq) {
+      demClipBusy = false;
+      syncClipDemButton();
+      hideDemProgress();
+    }
   }
 }
 
@@ -951,6 +997,8 @@ function addVertex(latlng) {
   }
   drawnLatLngs.push(L.latLng(latlng.lat, latlng.lng));
   centerlineFinished = false;
+  aoiFromServer = null;
+  invalidateDemClip();
   redrawDraft();
 }
 
@@ -966,12 +1014,12 @@ function finishCentreline() {
   centerlineFinished = true;
   coverAoiForExtendedCentreline();
   aoiFromServer = null;
+  invalidateDemClip();
   setMode("params");
   redrawDraft();
   redrawAoi(null, { fit: true });
-  scheduleDemPreview();
   setStatus(
-    `Analysis includes ${CENTERLINE_END_BUFFER_M} m upstream and downstream of the drawn centreline, along the channel.`,
+    `Analysis includes ${CENTERLINE_END_BUFFER_M} m upstream and downstream of the drawn centreline, along the channel. Click Clip DEM when the orange rectangle looks right.`,
     "ok"
   );
 }
@@ -1465,6 +1513,10 @@ async function requestXsProfile(start, end) {
 }
 
 function handleXsClick(latlng) {
+  if (!demClipIsCurrent()) {
+    setStatus("Clip the DEM for the orange rectangle first, then sample it.", "error");
+    return;
+  }
   if (xsPoints.length >= 2) {
     xsPoints = [];
     xsDraftLine.setLatLngs([]);
@@ -1514,10 +1566,10 @@ function setMode(next) {
     setStatus("Cross-section tool is on. Click two points on the map.", "ok");
   } else if (mode === "params") {
     map.dragging.enable();
-    setCoach("Set the DEM area of interest, then Run screening. Use Cross-section to sample the DEM, or double-click to pin a different bridge.");
+    setCoach("Adjust the orange rectangle, then Clip DEM to download the LiDAR. Use Cross-section after the DEM is on the map, or double-click to pin a different bridge.");
   } else if (marker) {
     map.dragging.enable();
-    setCoach("Set the DEM area of interest, then draw the river centreline through the bridge, or double-click elsewhere to move the pin.");
+    setCoach("Draw the orange polygon with the extents, then the river centreline. Clip DEM when the rectangle covers the reach you want.");
   } else {
     map.dragging.enable();
     setCoach("Navigate the map, then double-click a bridge to drop a pin.");
@@ -1547,8 +1599,10 @@ function bindMarker(lat, lon) {
       latInput.value = pos.lat.toFixed(6);
       lonInput.value = pos.lng.toFixed(6);
       marker.bindPopup(bridgeName || "Bridge").openPopup();
+      aoiFromServer = null;
+      redrawAoi(null, { fit: true });
+      invalidateDemClip();
       syncChrome();
-      scheduleDemPreview();
     });
   } else {
     marker.setLatLng([lat, lon]);
@@ -1571,7 +1625,6 @@ function placeBridge(lat, lon, name) {
   selectedSection = null;
   setMode("draw");
   redrawAoi(null, { fit: true });
-  scheduleDemPreview();
 }
 
 function stopOverlayClick(event) {
@@ -1993,12 +2046,18 @@ modeDrawBtn.addEventListener("click", (event) => {
 modeXsBtn.addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
+  if (!demClipIsCurrent()) {
+    setStatus("Clip the DEM for the orange rectangle first, then sample it.", "error");
+    return;
+  }
   setMode("xs");
 });
 
 undoBtn.addEventListener("click", () => {
   drawnLatLngs.pop();
   centerlineFinished = false;
+  aoiFromServer = null;
+  invalidateDemClip();
   redrawDraft();
 });
 
@@ -2008,11 +2067,12 @@ clearBtn.addEventListener("click", () => {
   ranTransects = false;
   overlay.clearLayers();
   aoiFromServer = null;
+  invalidateDemClip();
   redrawDraft();
-  scheduleDemPreview();
 });
 
 finishBtn.addEventListener("click", finishCentreline);
+if (clipDemBtn) clipDemBtn.addEventListener("click", clipSelectedDem);
 
 clearXsBtn.addEventListener("click", () => {
   resetXsDrawing();
@@ -2050,13 +2110,12 @@ document.addEventListener("click", (event) => {
 runForm.addEventListener("input", (event) => {
   updateLayoutPreview();
   if (event.target && (event.target.name === "along" || event.target.name === "length" || event.target.name === "interval")) {
-    scheduleDemPreview();
     refreshLegend();
   }
   if (event.target && (event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral")) {
     aoiFromServer = null;
+    invalidateDemClip();
     redrawAoi(null, { fit: true });
-    scheduleDemPreview();
     refreshLegend();
   }
   if (event.target && event.target.matches("[data-ari]")) {
@@ -2065,8 +2124,10 @@ runForm.addEventListener("input", (event) => {
 });
 
 runForm.addEventListener("change", (event) => {
-  if (event.target.name === "length" || event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral") {
-    scheduleDemPreview();
+  if (event.target && (event.target.name === "upstream" || event.target.name === "downstream" || event.target.name === "lateral")) {
+    aoiFromServer = null;
+    invalidateDemClip();
+    redrawAoi(null, { fit: true });
   }
   if (event.target && event.target.matches("[data-ari], [name^='flow_']")) {
     syncAriInputs();
