@@ -53,7 +53,9 @@ body {
   flex-direction: column;
   gap: 0.7rem;
   min-height: 0;
+  max-height: calc(100dvh - 6.2rem);
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .rail-start {
@@ -458,8 +460,10 @@ body.is-busy .mark {
   position: relative;
   z-index: 900;
   width: auto;
-  max-height: none;
+  min-height: 0;
+  max-height: calc(100dvh - 6.2rem);
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 1rem 1.05rem 1.1rem;
 }
 
@@ -820,6 +824,7 @@ button { font: inherit; cursor: pointer; }
 
 .results-scroll {
   overflow: auto;
+  overscroll-behavior: contain;
   max-width: 100%;
   max-height: min(36rem, 60vh);
   padding: 0.75rem;

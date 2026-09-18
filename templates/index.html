@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HydroBridge</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=dem-window">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=panel-scroll">
 </head>
 <body>
   <div class="app-frame">
@@ -88,7 +88,7 @@
     <p class="analysis">
       Analysis length
       <strong id="analysis-length">—</strong>
-      <span class="muted">from the drawn centreline</span>
+      <span class="muted">from the drawn centreline, plus 50 m at each end when you finish</span>
     </p>
     <p id="layout-preview" class="muted">Draw the centreline to set transect count.</p>
 
@@ -98,7 +98,7 @@
         <button type="button" class="help" aria-label="What is the DEM area of interest?" data-help="help-aoi">?</button>
       </legend>
       <span id="help-aoi" class="help-pop" role="tooltip" hidden>
-        The bridge pin is the centre. Upstream, downstream, and lateral distances define four edge points. Those points form a rectangle. HydroBridge crops that window from the LINZ 1 m LiDAR tiles instead of downloading whole Topo50 sheets. Each distance can be 10–5,000 m. The window size is (upstream + downstream) along the river by twice the lateral extent. For 1,500 m × 1,000 m use 750 m up, 750 m down, and 500 m each side.
+        The bridge pin is the centre. Upstream, downstream, and lateral distances define four edge points. Those points form a rectangle. HydroBridge crops that window from the LINZ 1 m LiDAR tiles instead of downloading whole Topo50 sheets. Each distance can be 10–5,000 m. The window size is (upstream + downstream) along the river by twice the lateral extent. For 1,500 m × 1,000 m use 750 m up, 750 m down, and 500 m each side. Finishing the centreline extends the analysis 50 m upstream and 50 m downstream along the channel and grows the window if needed so those ends stay inside the crop.
       </span>
       <p class="muted">Distances from the pin, 10–5,000 m each. The rectangle rotates to the centreline (downstream is forward) or sits north-up until a line is drawn.</p>
       <p id="aoi-size" class="muted">LiDAR window 500 m along × 500 m across.</p>
@@ -299,6 +299,6 @@
   <div id="xs-measure" class="xs-measure" hidden role="status" aria-live="polite">0.0 m</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="{{ url_for('static', filename='app.js') }}?v=dem-window"></script>
+  <script src="{{ url_for('static', filename='app.js') }}?v=panel-scroll"></script>
 </body>
 </html>
